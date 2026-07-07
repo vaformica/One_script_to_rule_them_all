@@ -1,0 +1,2 @@
+IDTracker Firebird TOML Folder Package v13
+Fix: post-processing/collector partition defaults to blank so Firebird chooses a valid non-GPU/default partition.
