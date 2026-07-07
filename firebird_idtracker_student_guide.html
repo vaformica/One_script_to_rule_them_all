@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Firebird IDtracker.ai TOML-Folder Pipeline: Student Guide</title>
+<style>
+:root{
+  --ink:#1f2937;--muted:#586174;--blue:#184e77;--blue2:#1e6091;--pale:#f4f8fb;--line:#d5dee8;
+  --green:#176c45;--greenbg:#eef9f2;--amber:#8a5a00;--amberbg:#fff8e8;--red:#9d2a2a;--redbg:#fff1f1;
+}
+*{box-sizing:border-box} body{font-family:Arial,Helvetica,sans-serif;line-height:1.48;margin:0;color:var(--ink);background:#fff}
+header{background:linear-gradient(135deg,#12385f,#1e6091);color:white;padding:2rem 2.5rem} header h1{margin:0 0 .4rem;font-size:2rem} header p{margin:.25rem 0;max-width:1050px}
+main{max-width:1220px;margin:0 auto;padding:1.5rem 2rem 3rem}.toc{background:var(--pale);border:1px solid var(--line);border-radius:12px;padding:1rem 1.25rem;margin:1.25rem 0}.toc a{display:inline-block;margin:.2rem .8rem .2rem 0;color:var(--blue);text-decoration:none}.toc a:hover{text-decoration:underline}
+h2{color:var(--blue);border-bottom:2px solid var(--line);padding-bottom:.25rem;margin-top:2rem}h3{color:#24415c;margin-top:1.4rem}h4{margin-bottom:.2rem;color:#333}
+.card{border:1px solid var(--line);border-radius:12px;padding:1rem;margin:1rem 0;background:white;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+.ok{border-left:6px solid var(--green);background:var(--greenbg)}.warn{border-left:6px solid var(--amber);background:var(--amberbg)}.danger{border-left:6px solid var(--red);background:var(--redbg)}.note{border-left:6px solid var(--blue2);background:#eef7ff}
+code{font-family:Consolas,Menlo,monospace;background:#eef2f6;border-radius:4px;padding:.08rem .28rem}pre{background:#0f172a;color:#e5e7eb;padding:1rem;border-radius:10px;overflow:auto}pre code{background:transparent;color:inherit;padding:0}
+table{border-collapse:collapse;width:100%;margin:.8rem 0 1.2rem;font-size:.94rem}th,td{border:1px solid #ccd6e0;padding:.45rem .55rem;vertical-align:top}th{background:#eaf1f8;color:#17324d;text-align:left}tr:nth-child(even) td{background:#fbfcfd}.small{font-size:.88rem;color:var(--muted)}.kbd{font-family:Consolas,Menlo,monospace;background:#eee;border:1px solid #ccc;border-bottom:2px solid #bbb;border-radius:4px;padding:.08rem .35rem}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1rem}.step{counter-increment:step}.step h3:before{content:counter(step) ". ";color:var(--blue2)}.steps{counter-reset:step}.pill{display:inline-block;padding:.12rem .45rem;border-radius:999px;background:#e8f2fb;color:#16486c;font-weight:bold;font-size:.82rem}.good{color:var(--green);font-weight:bold}.bad{color:var(--red);font-weight:bold}.todo{background:#fcfcfc;border:1px dashed #bbb;border-radius:10px;padding:.75rem}
+footer{border-top:1px solid var(--line);margin-top:3rem;padding-top:1rem;color:var(--muted);font-size:.9rem}
+</style>
+</head>
+<body>
+<header>
+  <h1>Firebird IDtracker.ai TOML-Folder Pipeline</h1>
+  <p><strong>Student guide, data dictionary, and parameter reference</strong></p>
+  <p>This guide explains how to process IDtracker.ai TOML files on Firebird for BA/single-beetle assays and fight/two-beetle assays.</p>
+</header>
+<main>
+<div class="toc">
+  <strong>Jump to:</strong><br>
+  <a href="#overview">Overview</a>
+  <a href="#concepts">Key concepts</a>
+  <a href="#setup">Setup</a>
+  <a href="#workflow">Workflow</a>
+  <a href="#reruns">Reruns and partial runs</a>
+  <a href="#status">Status and completion</a>
+  <a href="#outputs">Output structure</a>
+  <a href="#dictionary">Data dictionary</a>
+  <a href="#parameters">Parameter reference</a>
+  <a href="#standalone">Standalone scripts</a>
+  <a href="#troubleshooting">Troubleshooting</a>
+</div>
+
+<section id="overview">
+<h2>1. What this pipeline does</h2>
+<p>This package is a Firebird-friendly wrapper around IDtracker.ai and the lab's post-processing scripts. It is designed for the common lab workflow where a single original video contains one or more separate arenas or cells. Students use the IDtracker.ai Segmentation app by hand to create one TOML file per arena/cell, then this pipeline runs all the TOMLs in batch, organizes the IDtracker.ai sessions, and creates analysis CSVs and QC maps.</p>
+<div class="card ok">
+<p><strong>The basic idea:</strong> the original video is the raw data, each TOML is one arena/cell from that video, and every output row is tagged with the original video name, TOML name, cell label, and metadata tag so results remain traceable after CSV files are concatenated.</p>
+</div>
+<div class="grid">
+  <div class="card"><h3>BA pipeline</h3><p>Use for one-beetle behavioral assay videos. Expected animals per TOML: <strong>1</strong>. Outputs individual movement, onset, ROI/wall-buffer, interpolation, turtling-like QC, per-frame kinematics, and track maps.</p></div>
+  <div class="card"><h3>Fight pipeline</h3><p>Use for two-beetle combat videos. Expected animals per TOML: <strong>2</strong>. Outputs BA-style metrics for both beetles plus pairwise distance, contact/proximity events, possible fight-like events, InqScribe text, and track maps.</p></div>
+</div>
+</section>
+
+<section id="concepts">
+<h2>2. Key concepts and vocabulary</h2>
+<table>
+<tr><th>Term</th><th>Meaning</th><th>Why it matters</th></tr>
+<tr><td>Original video</td><td>The source <code>.mp4</code>, <code>.avi</code>, or similar file used in IDtracker.ai.</td><td>This is the primary raw-data identity. All output rows should point back to this video.</td></tr>
+<tr><td>TOML file</td><td>IDtracker.ai parameter file created manually in the Segmentation app.</td><td>Each TOML stores the selected video, ROI polygon, tracking interval, number of animals, and segmentation settings.</td></tr>
+<tr><td>Cell / arena label</td><td>The arena identifier, usually from the end of the TOML filename, such as <code>A1</code>, <code>B3</code>, or <code>C2</code>.</td><td>The same video can have multiple TOMLs. The cell label keeps each arena separate.</td></tr>
+<tr><td>Metadata tag</td><td>Human-readable tag entered in the GUI, often the video stem or experiment label.</td><td>This is copied into summary CSV filenames and every row of output data.</td></tr>
+<tr><td>Manifest</td><td>CSV created by the GUI that links video → TOML → cell label → output stem.</td><td>The manifest is the authoritative map between raw video, TOML, session folder, and output files.</td></tr>
+<tr><td>IDtracker session</td><td>Folder created by IDtracker.ai containing trajectory arrays and session metadata.</td><td>The pipeline moves full session folders into the TOML folder so video storage stays clean.</td></tr>
+<tr><td>Collector</td><td>Pipeline stage that finds completed IDtracker sessions and moves them to the organized output folder.</td><td>This stage prevents IDtracker.ai session folders from being left in the original video folder.</td></tr>
+<tr><td>Post-processing</td><td>Python analysis stage after tracking.</td><td>Creates summaries, events, per-frame data, maps, and data dictionaries.</td></tr>
+</table>
+</section>
+
+<section id="setup">
+<h2>3. Setup on Firebird</h2>
+<p>Use the <code>idtrackerai</code> conda environment when launching the GUI. The normal workflow is to run the GUI from noVNC on Firebird.</p>
+<h3>Install the package</h3>
+<pre><code>conda activate idtrackerai
+python -m zipfile -e IDTracker_Firebird_TOML_Folder_Package_v13_partition_default_fix.zip .
+cd IDTracker_Firebird_TOML_Folder_Package
+bash install_on_firebird.sh</code></pre>
+<h3>Launch the GUI</h3>
+<pre><code>conda activate idtrackerai
+cd ~/formicalab/IDTracker_Firebird_TOML_Folder
+bash launch_gui.sh</code></pre>
+<div class="card warn">
+<p><strong>Do not launch from the base environment.</strong> If the terminal prompt says <code>(base)</code>, run <code>conda activate idtrackerai</code> first. The GUI and IDtracker.ai need packages from that environment.</p>
+</div>
+</section>
+
+<section id="workflow" class="steps">
+<h2>4. Student workflow from video to output CSVs</h2>
+<div class="card step"><h3>Create TOMLs manually in IDtracker.ai</h3><p>Open the IDtracker.ai Segmentation app. For each arena/cell in the video, set the ROI polygon, blob size/background subtraction settings, tracking interval, and expected number of animals. Save one TOML per arena/cell.</p><p>Recommended naming pattern:</p><pre><code>Camera_1_40169154_20260630_1342_FIGHT_ACT1_A1.toml
+Camera_1_40169154_20260630_1342_FIGHT_ACT1_A2.toml
+Camera_1_40169154_20260630_1342_FIGHT_ACT1_B1.toml</code></pre></div>
+<div class="card step"><h3>Put TOMLs for one video in one folder</h3><p>One TOML folder should contain TOMLs for one original video and one assay type only. Do not mix fight and BA TOMLs in the same folder. Do not mix TOMLs from different videos.</p></div>
+<div class="card step"><h3>Select the original video and TOML folder in the GUI</h3><p>Choose the original video file first, then the TOML folder. Choose the pipeline: <strong>BA</strong> or <strong>Fight</strong>. Each video should be either BA or fight, not both.</p></div>
+<div class="card step"><h3>Import and validate</h3><p>Click the import/validate button. The GUI reads all TOMLs, checks that they point to the selected video, extracts the tracking interval start frame, checks expected animal number, and creates the import grid.</p><p>If the video and TOMLs do not match, stop and choose the correct video or correct TOML folder. The safest consequence is to clear the current selection and start the import again. The GUI should not delete TOMLs.</p></div>
+<div class="card step"><h3>Check cell labels</h3><p>The GUI guesses the cell label from the end of each TOML filename, such as <code>A1</code> or <code>B3</code>. Edit labels if needed. Cell labels must be unique within a video.</p></div>
+<div class="card step"><h3>Remove TOMLs from the run if needed</h3><p>Use <strong>Remove selected TOML from run</strong> to exclude a TOML from the current manifest without deleting the file. Use <strong>Restore selected TOML to run</strong> to include it again.</p><p>This is useful when most cells already ran successfully but one TOML needs to be rerun or reprocessed.</p></div>
+<div class="card step"><h3>Run the pipeline</h3><p>For a full run, the GUI submits three stages to SLURM:</p><ol><li>IDtracker.ai GPU array job.</li><li>Session collector job.</li><li>Post-processing job.</li></ol><p>The default GPU request is <strong>Any GPU</strong> to maximize the number of simultaneous jobs. L40S-only is available but may run fewer jobs at once.</p></div>
+</section>
+
+<section id="reruns">
+<h2>5. Reruns, partial runs, and overwriting</h2>
+<table>
+<tr><th>Situation</th><th>Recommended action</th><th>What happens</th></tr>
+<tr><td>First time running a TOML folder</td><td>Full pipeline</td><td>Runs IDtracker.ai, collects sessions, runs post-processing.</td></tr>
+<tr><td>Only maps/CSV outputs need updating</td><td>Python-only post-processing</td><td>Uses existing collected session folders and regenerates post-processing outputs.</td></tr>
+<tr><td>One TOML was corrected in Segmentation app</td><td>Remove successful TOMLs from run, keep corrected TOML active, run full pipeline for that subset</td><td>Runs only the active TOMLs in the manifest.</td></tr>
+<tr><td>A TOML folder already has sessions and post-processing outputs</td><td>Use the GUI prompt to choose rerun IDtracker, rerun Python only, or do nothing</td><td>Prevents silent overwrites and makes reruns intentional.</td></tr>
+<tr><td>A TOML file is wrong and should be recreated</td><td>Remove it from the run or fix it in IDtracker.ai</td><td>The GUI does not delete TOML files.</td></tr>
+</table>
+<div class="card note"><p><strong>Important:</strong> Python-only work is still normally submitted to SLURM as a CPU/default-partition job, so it can keep running after the GUI is closed. If the CPU/default partition is busy, it may sit pending before it starts.</p></div>
+</section>
+
+<section id="status">
+<h2>6. How to know whether the pipeline is finished</h2>
+<p>The GUI's status summary is the easiest place to check. A successful complete run should say:</p>
+<ul><li><strong>Overall status:</strong> COMPLETE</li><li><strong>Collected sessions with trajectories:</strong> N/N</li><li><strong>Post-processed cells OK:</strong> N/N</li><li><strong>Warnings:</strong> none</li><li><strong>Errors:</strong> none</li></ul>
+<h3>Useful SLURM commands</h3>
+<pre><code>squeue -u vformic1-swat</code></pre>
+<p>To watch jobs update every 10 seconds:</p>
+<pre><code>watch -n 10 'squeue -u vformic1-swat'</code></pre>
+<p>To cancel old stuck jobs by ID:</p>
+<pre><code>scancel 823224 823119</code></pre>
+<h3>Completion markers</h3>
+<table>
+<tr><th>File</th><th>Meaning</th></tr>
+<tr><td><code>project_metadata/_SESSION_COLLECTION_COMPLETE_ALL_CELLS.txt</code></td><td>Collector found and moved sessions for all active TOML rows.</td></tr>
+<tr><td><code>project_metadata/_SESSION_COLLECTION_INCOMPLETE_OR_FAILED.txt</code></td><td>Collector could not verify all expected sessions.</td></tr>
+<tr><td><code>postprocessing/fight_postprocessing/_POSTPROCESS_COMPLETE_ALL_CELLS.txt</code></td><td>Fight post-processing succeeded for all active TOMLs.</td></tr>
+<tr><td><code>postprocessing/ba_postprocessing/_POSTPROCESS_COMPLETE_ALL_CELLS.txt</code></td><td>BA post-processing succeeded for all active TOMLs.</td></tr>
+<tr><td><code>_POSTPROCESS_INCOMPLETE_OR_FAILED.txt</code></td><td>At least one cell did not post-process successfully.</td></tr>
+</table>
+<div class="card ok"><p>Once jobs are submitted to SLURM, they continue running even if the GUI closes, noVNC disconnects, or your laptop sleeps. The GUI is a submitter/status viewer; SLURM owns the jobs.</p></div>
+</section>
+
+<section id="outputs">
+<h2>7. Output folder structure</h2>
+<p>All outputs are kept inside the TOML folder so results stay tightly linked to the TOMLs used to create them.</p>
+<pre><code>TOML_FOLDER/
+├── *.toml
+├── project_metadata/
+│   ├── run_config.json
+│   ├── toml_import_grid.csv
+│   ├── toml_video_manifest.csv
+│   ├── session_collection_report.csv
+│   ├── pipeline_status_summary.txt
+│   └── pipeline_status_summary.json
+├── logs/
+├── gui_slurm/
+├── idtracker_sessions/
+│   └── ORIGINAL_VIDEO_STEM/
+│       ├── ORIGINAL_VIDEO_STEM__A1/
+│       ├── ORIGINAL_VIDEO_STEM__A2/
+│       └── ORIGINAL_VIDEO_STEM__B1/
+└── postprocessing/
+    ├── fight_postprocessing/
+    │   ├── fight_pair_summary_all.csv
+    │   ├── METADATA_TAG_fight_pair_summary_all.csv
+    │   ├── fight_individual_summary_all.csv
+    │   ├── METADATA_TAG_fight_individual_summary_all.csv
+    │   ├── postprocessing_manifest.csv
+    │   ├── postprocessing_status_by_cell.csv
+    │   ├── all_track_maps/
+    │   └── session_outputs/
+    └── ba_postprocessing/
+        ├── ba_individual_summary_all.csv
+        ├── METADATA_TAG_ba_individual_summary_all.csv
+        ├── postprocessing_manifest.csv
+        ├── postprocessing_status_by_cell.csv
+        ├── all_track_maps/
+        └── session_outputs/</code></pre>
+</section>
+
+<section id="dictionary">
+<h2>8. Data dictionary</h2>
+<h3>8.1 Provenance columns repeated in output CSVs</h3>
+<p>These columns are repeated in all major output CSVs so concatenated spreadsheets remain traceable.</p>
+<table>
+<tr><th>Column</th><th>Meaning</th></tr>
+<tr><td><code>project_id</code></td><td>Unique ID generated from the TOML/video selection.</td></tr>
+<tr><td><code>project_name</code></td><td>Human-readable project/video name, usually based on the TOML folder or video stem.</td></tr>
+<tr><td><code>project_folder</code></td><td>Path to the TOML folder/project folder.</td></tr>
+<tr><td><code>metadata_tag</code></td><td>User-entered tag copied into every row and summary filename.</td></tr>
+<tr><td><code>pipeline</code></td><td><code>ba</code> or <code>fight</code>.</td></tr>
+<tr><td><code>video_id</code></td><td>Video identifier, usually the original video stem.</td></tr>
+<tr><td><code>original_video_path</code></td><td>Full path to the original source video file.</td></tr>
+<tr><td><code>original_video_name</code></td><td>Original video filename.</td></tr>
+<tr><td><code>original_video_stem</code></td><td>Original video filename without extension.</td></tr>
+<tr><td><code>video_size_bytes</code></td><td>Size of the original video file at import time.</td></tr>
+<tr><td><code>video_mtime_iso</code></td><td>Video modification time at import time.</td></tr>
+<tr><td><code>cell_id</code></td><td>Cell/arena ID, usually same as cell label.</td></tr>
+<tr><td><code>cell_label</code></td><td>Editable arena/cell label such as A1, B3, or C2.</td></tr>
+<tr><td><code>cell_notes</code></td><td>Notes for the cell row, if present.</td></tr>
+<tr><td><code>expected_animals</code></td><td>Expected animal count for pipeline: 1 for BA, 2 for fight.</td></tr>
+<tr><td><code>toml_folder</code></td><td>Folder containing TOMLs.</td></tr>
+<tr><td><code>toml_path</code></td><td>Full path to the TOML file.</td></tr>
+<tr><td><code>toml_name</code></td><td>TOML filename.</td></tr>
+<tr><td><code>toml_stem</code></td><td>TOML filename without extension.</td></tr>
+<tr><td><code>toml_tracking_interval_start_frame</code></td><td>First frame of IDtracker.ai tracking interval extracted from TOML.</td></tr>
+<tr><td><code>toml_tracking_interval_end_frame</code></td><td>Last/end frame of IDtracker.ai tracking interval extracted from TOML.</td></tr>
+<tr><td><code>toml_analysis_start_frame</code></td><td>Frame used as analysis start; normally first frame of tracking interval.</td></tr>
+<tr><td><code>output_stem</code></td><td>Output naming stem, usually <code>original_video_stem__cell_label</code>.</td></tr>
+<tr><td><code>idtracker_session_name</code></td><td>Name of the moved IDtracker.ai session folder.</td></tr>
+</table>
+
+<h3>8.2 Manifest and status files</h3>
+<table>
+<tr><th>File</th><th>Important columns</th><th>Purpose</th></tr>
+<tr><td><code>toml_import_grid.csv</code></td><td>cell label, TOML path, video path, validation status, run_this_toml</td><td>Saved version of the GUI import grid.</td></tr>
+<tr><td><code>toml_video_manifest.csv</code></td><td>all provenance columns plus validation columns</td><td>Active manifest used by SLURM and post-processing.</td></tr>
+<tr><td><code>session_collection_report.csv</code></td><td>cell_label, output_stem, session_found, trajectory_found, original_session_path, moved_session_path, status, error_message</td><td>Shows whether each IDtracker.ai session was found and moved.</td></tr>
+<tr><td><code>postprocessing_status_by_cell.csv</code></td><td>cell_label, output_stem, processed, status, error_message</td><td>Shows whether Python post-processing worked for each cell.</td></tr>
+<tr><td><code>postprocessing_manifest.csv</code></td><td>session_folder, trajectory_file, output_dir, pipeline, status, error</td><td>Post-processing audit trail.</td></tr>
+<tr><td><code>pipeline_status_summary.txt/json</code></td><td>overall status, expected counts, warnings, errors</td><td>Final status summary shown by GUI.</td></tr>
+</table>
+
+<h3>8.3 Individual summary columns</h3>
+<p>These appear in BA summaries and in fight individual summaries for each beetle.</p>
+<table>
+<tr><th>Column</th><th>Meaning</th></tr>
+<tr><td><code>session_name</code></td><td>IDtracker.ai session folder name.</td></tr>
+<tr><td><code>animal_index_0_based</code></td><td>Animal index in trajectory array, starting at 0.</td></tr>
+<tr><td><code>n_animals_in_file</code></td><td>Number of animals found in the trajectory file.</td></tr>
+<tr><td><code>analysis_start_frame</code></td><td>Global frame where analysis begins.</td></tr>
+<tr><td><code>analysis_end_frame_inclusive</code></td><td>Last global frame included in analysis.</td></tr>
+<tr><td><code>requested_window_frames</code></td><td>Requested number of frames after analysis start.</td></tr>
+<tr><td><code>actual_window_frames</code></td><td>Actual number of frames analyzed.</td></tr>
+<tr><td><code>first_valid_position_frame_global</code></td><td>First frame with valid x/y coordinates.</td></tr>
+<tr><td><code>last_valid_position_frame_global</code></td><td>Last frame with valid x/y coordinates.</td></tr>
+<tr><td><code>n_total_interpolated_position_frames</code></td><td>Frames filled by interpolation after artifact/missing filtering.</td></tr>
+<tr><td><code>fraction_total_interpolated_position_frames</code></td><td>Fraction of analyzed frames that were interpolated.</td></tr>
+<tr><td><code>move_threshold_px</code></td><td>Movement threshold used for onset metrics.</td></tr>
+<tr><td><code>latency_to_displacement_threshold_frames</code></td><td>Frames from analysis start until displacement from start first exceeds threshold.</td></tr>
+<tr><td><code>latency_to_sustained_displacement_threshold_frames</code></td><td>Frames from analysis start until sustained movement onset.</td></tr>
+<tr><td><code>total_distance_px</code></td><td>Total centroid path length.</td></tr>
+<tr><td><code>net_displacement_px</code></td><td>Straight-line distance from first to last valid position.</td></tr>
+<tr><td><code>path_straightness_net_over_total</code></td><td>Net displacement divided by total distance. Lower values indicate more looping or tortuous paths.</td></tr>
+<tr><td><code>roi_wall_buffer_px</code></td><td>Distance from ROI boundary used to classify border occupancy.</td></tr>
+<tr><td><code>frames_inside_primary_roi</code></td><td>Frames inside the main arena ROI.</td></tr>
+<tr><td><code>frames_in_primary_roi_border_buffer</code></td><td>Frames inside the ROI and within the wall/border buffer.</td></tr>
+<tr><td><code>frames_not_in_primary_roi_border_buffer</code></td><td>Frames inside the ROI but away from the wall buffer.</td></tr>
+<tr><td><code>frames_inside_secondary_roi</code></td><td>Frames inside optional secondary ROI, if present.</td></tr>
+<tr><td><code>turtling_event_count</code></td><td>Number of centroid-defined turtling-like events.</td></tr>
+<tr><td><code>turtling_total_frames</code></td><td>Total frames flagged as turtling-like.</td></tr>
+<tr><td><code>turtling_fraction_frames</code></td><td>Fraction of analyzed frames flagged as turtling-like.</td></tr>
+</table>
+
+<h3>8.4 Fight pair summary columns</h3>
+<table>
+<tr><th>Column</th><th>Meaning</th></tr>
+<tr><td><code>contact_px</code></td><td>Distance threshold for contact/proximity events.</td></tr>
+<tr><td><code>min_contact_s</code></td><td>Minimum contact event duration in seconds according to the FPS conversion parameter.</td></tr>
+<tr><td><code>fight_px</code></td><td>Stricter distance threshold for possible fight-like close-contact events.</td></tr>
+<tr><td><code>min_fight_frames</code></td><td>Minimum number of frames required for possible fight-like event.</td></tr>
+<tr><td><code>valid_pair_frames</code></td><td>Frames where both beetles have valid positions.</td></tr>
+<tr><td><code>fraction_valid_pair_frames</code></td><td>Fraction of analyzed frames with valid pairwise distance.</td></tr>
+<tr><td><code>mean_pairwise_distance_px</code></td><td>Mean distance between the two beetles.</td></tr>
+<tr><td><code>median_pairwise_distance_px</code></td><td>Median pairwise distance.</td></tr>
+<tr><td><code>min_pairwise_distance_px</code></td><td>Minimum observed pairwise distance.</td></tr>
+<tr><td><code>contact_frame_count</code></td><td>Frames where pairwise distance is at or below contact threshold.</td></tr>
+<tr><td><code>contact_event_count</code></td><td>Number of contact/proximity events after applying minimum duration.</td></tr>
+<tr><td><code>contact_total_duration_frames</code></td><td>Total duration of contact events in frames.</td></tr>
+<tr><td><code>possible_fight_frame_count</code></td><td>Frames at or below possible-fight threshold.</td></tr>
+<tr><td><code>possible_fight_event_count</code></td><td>Number of possible fight-like events after applying minimum duration.</td></tr>
+<tr><td><code>both_animals_inside_secondary_roi_frames</code></td><td>Frames where both animals are in the optional secondary ROI.</td></tr>
+<tr><td><code>contact_inside_secondary_roi_frames</code></td><td>Contact frames where both animals are inside the secondary ROI.</td></tr>
+</table>
+
+<h3>8.5 Per-frame and event files</h3>
+<table>
+<tr><th>File pattern</th><th>Meaning</th></tr>
+<tr><td><code>*_animal0_per_frame_kinematics.csv</code>, <code>*_animal1_per_frame_kinematics.csv</code></td><td>One row per frame for each individual. Contains x/y coordinates, step distance, cumulative distance, ROI status, interpolation flag, and turtling-like flag.</td></tr>
+<tr><td><code>*_per_frame_pairwise.csv</code></td><td>Fight-only per-frame pairwise distances, contact flags, possible-fight flags, and secondary ROI status.</td></tr>
+<tr><td><code>*_contact_events.csv</code></td><td>Fight-only event table for contact/proximity episodes.</td></tr>
+<tr><td><code>*_possible_fight_events.csv</code></td><td>Fight-only event table for very-close-contact candidate fight-like episodes.</td></tr>
+<tr><td><code>*_turtling_events_animal0.csv</code></td><td>Detected turtling-like events for one animal. These are centroid/path-shape QC events, not posture-classified events.</td></tr>
+<tr><td><code>*_track_map.png</code></td><td>QC map showing tracks, start/end, sustained onset, interpolation points, and turtling-like points.</td></tr>
+<tr><td><code>*_InqScribe_*.txt</code></td><td>Fight-only InqScribe-friendly contact-event annotation file.</td></tr>
+</table>
+</section>
+
+<section id="parameters">
+<h2>9. Parameter reference</h2>
+<h3>9.1 Shared parameters</h3>
+<table>
+<tr><th>GUI label / flag</th><th>Default</th><th>What it does</th><th>Practical advice</th></tr>
+<tr><td>Analysis window length, frames<br><code>--window-frames</code></td><td>7500</td><td>Number of frames analyzed after the TOML-derived analysis start frame.</td><td>Increase for longer runs. Decrease for quick tests.</td></tr>
+<tr><td>Video frames per second<br><code>--fps</code></td><td>30</td><td>Used to convert frames to seconds in event files and convenience columns. Does not change the frame indices used for analysis.</td><td>If one analyzed frame equals one biological second, use 1 for biologically meaningful seconds. If analyzing true 30 fps video, use 30.</td></tr>
+<tr><td>Movement threshold, pixels<br><code>--move-threshold-px</code></td><td>30</td><td>Displacement/cumulative movement threshold for movement onset metrics.</td><td>Increase if small jitter is being counted as movement. Decrease if real movement is subtle.</td></tr>
+<tr><td>Sustained movement frames<br><code>--movement-onset-consecutive-frames</code></td><td>30</td><td>Frames required for sustained movement onset after crossing threshold.</td><td>Increase to require more persistent movement. Decrease for more sensitive onset detection.</td></tr>
+<tr><td>Artifact jump threshold, pixels<br><code>--max-step-px</code></td><td>30</td><td>One-frame jumps larger than this are treated as likely tracking artifacts and interpolated if bounded by valid positions.</td><td>Increase if fast real movement is falsely flagged. Decrease if identity/tracking jumps remain in the data.</td></tr>
+<tr><td>ROI wall buffer, pixels<br><code>--roi-wall-buffer-px</code></td><td>30</td><td>Distance from primary ROI boundary used to classify border/wall occupancy.</td><td>Set based on arena size and how close to the wall counts as wall-associated behavior.</td></tr>
+<tr><td>Track linewidth<br><code>--track-linewidth</code></td><td>0.4</td><td>Line thickness on QC maps.</td><td>Increase if maps are too faint. Decrease if dense paths are unreadable.</td></tr>
+<tr><td>Map max overlay points<br><code>--map-max-overlay-points</code></td><td>400</td><td>Maximum number of interpolation/turtling overlay points drawn on maps.</td><td>Prevents maps from becoming unreadable when many frames are flagged.</td></tr>
+</table>
+
+<h3>9.2 Fight-specific parameters</h3>
+<table>
+<tr><th>Parameter</th><th>Default</th><th>Meaning</th><th>Practical effect</th></tr>
+<tr><td><code>--animal0</code>, <code>--animal1</code></td><td>0, 1</td><td>Zero-based indices for the two animals in the trajectory file.</td><td>Usually leave as 0 and 1.</td></tr>
+<tr><td><code>--contact-px</code></td><td>60</td><td>Pairwise distance threshold for contact/proximity events.</td><td>Lower is stricter. Higher captures broader proximity.</td></tr>
+<tr><td><code>--min-contact-s</code></td><td>0.2</td><td>Minimum contact duration in seconds, converted using FPS.</td><td>Use with caution if FPS does not equal biological sampling rate.</td></tr>
+<tr><td><code>--fight-px</code></td><td>35</td><td>Stricter pairwise distance threshold for possible fight-like close-contact events.</td><td>Lower means only very close episodes are flagged.</td></tr>
+<tr><td><code>--min-fight-frames</code></td><td>6</td><td>Minimum frames required for possible fight-like event.</td><td>Increase to remove brief close passes. Decrease to detect shorter events.</td></tr>
+</table>
+
+<h3>9.3 Turtling-like event parameters</h3>
+<div class="card warn"><p><strong>Turtling output is not a posture classifier.</strong> It uses centroid path shape: enough path length, low net displacement, compact spatial spread, low straightness, and turning. Treat it as a QC/event-discovery measure that should be verified against video.</p></div>
+<table>
+<tr><th>Parameter</th><th>Default</th><th>What stricter means</th><th>Notes</th></tr>
+<tr><td><code>--turtling-window-frames</code></td><td>300</td><td>Larger window requires behavior to persist over a longer segment.</td><td>In 1 fps biological time, 300 frames is about 300 seconds.</td></tr>
+<tr><td><code>--turtling-min-duration-frames</code></td><td>300</td><td>Larger value requires longer retained events.</td><td>Do not blindly set to 600 if each frame is one second unless you really mean 10 minutes.</td></tr>
+<tr><td><code>--turtling-merge-gap-frames</code></td><td>60</td><td>Smaller value keeps nearby bouts separate.</td><td>Larger value merges nearby candidate windows.</td></tr>
+<tr><td><code>--turtling-max-net-displacement-px</code></td><td>80</td><td>Lower value requires the animal to end closer to where it started.</td><td>Good control for avoiding ordinary travel being marked turtling-like.</td></tr>
+<tr><td><code>--turtling-max-radius-gyration-px</code></td><td>50</td><td>Lower value requires spatially compact behavior.</td><td>This is often a better strictness knob than duration.</td></tr>
+<tr><td><code>--turtling-max-straightness</code></td><td>0.25</td><td>Lower value requires a less straight, more looping path.</td><td>Straightness = net displacement / path length.</td></tr>
+<tr><td><code>--turtling-min-path-px</code></td><td>80</td><td>Higher value requires more total movement within the compact area.</td><td>Helps distinguish turtling-like scrambling from simply sitting still.</td></tr>
+<tr><td><code>--turtling-min-abs-turn-rad</code></td><td>0.30</td><td>Higher value requires more turning.</td><td>Useful if straight shuffling is being flagged.</td></tr>
+<tr><td><code>--turtling-start-buffer-frames</code></td><td>300</td><td>Larger value ignores early frames after movement onset.</td><td>Useful if early wake-up behavior is being mislabeled.</td></tr>
+</table>
+<p>If turtling is too permissive, first try lowering <code>turtling_max_radius_gyration_px</code>, lowering <code>turtling_max_net_displacement_px</code>, increasing <code>turtling_min_path_px</code>, or increasing <code>turtling_min_abs_turn_rad</code>. Duration is biologically meaningful, so change it only if you really want longer events.</p>
+</section>
+
+<section id="standalone">
+<h2>10. Running post-processing without the GUI</h2>
+<p>The package includes standalone scripts for cases where the GUI is unavailable or you only want to rerun Python post-processing.</p>
+<h3>Fight post-processing only</h3>
+<pre><code>conda activate idtrackerai
+cd ~/formicalab/IDTracker_Firebird_TOML_Folder
+python standalone/run_fight_postprocessing_standalone.py \
+  --toml-folder /path/to/TOML_FOLDER</code></pre>
+<h3>BA post-processing only</h3>
+<pre><code>conda activate idtrackerai
+cd ~/formicalab/IDTracker_Firebird_TOML_Folder
+python standalone/run_ba_postprocessing_standalone.py \
+  --toml-folder /path/to/TOML_FOLDER</code></pre>
+<h3>Submit standalone post-processing to SLURM</h3>
+<p>Leave the partition blank unless Firebird staff tell you the correct CPU partition name.</p>
+<pre><code>python standalone/run_fight_postprocessing_standalone.py \
+  --toml-folder /path/to/TOML_FOLDER \
+  --submit-cpu</code></pre>
+</section>
+
+<section id="troubleshooting">
+<h2>11. Troubleshooting</h2>
+<table>
+<tr><th>Symptom</th><th>Likely cause</th><th>What to do</th></tr>
+<tr><td>GUI fails with no PyQt/PySide module</td><td>Launched from <code>base</code> instead of <code>idtrackerai</code>, or Qt is not installed in environment.</td><td>Run <code>conda activate idtrackerai</code>. If needed, install PyQt in that environment.</td></tr>
+<tr><td>Video/TOML mismatch error</td><td>TOMLs point to a different video than the one selected in GUI.</td><td>Clear the selection, choose the correct original video and TOML folder, then re-import.</td></tr>
+<tr><td>SLURM says invalid partition</td><td>A partition name such as <code>cpu</code> was specified but does not exist on Firebird.</td><td>Leave the post-processing partition field blank so SLURM uses the default valid partition.</td></tr>
+<tr><td>IDtracker jobs finish but post-processing waits</td><td>Collector or post-processing job is pending in SLURM.</td><td>Check <code>squeue -u vformic1-swat</code>. If pending for resources, wait or ask which CPU/default partition should be used.</td></tr>
+<tr><td>Old jobs remain with DependencyNeverSatisfied</td><td>Old dependent jobs from a failed run.</td><td>Cancel the specific job IDs with <code>scancel JOBID</code>.</td></tr>
+<tr><td>Session folders appear beside original videos</td><td>IDtracker.ai writes sessions near the original video before collector moves them.</td><td>This is expected during/after tracking. The collector should move full sessions into the TOML folder.</td></tr>
+<tr><td>Status says collected 0/N while tracking is still running</td><td>Collector has not run yet.</td><td>Wait until IDtracker array finishes and collector starts.</td></tr>
+<tr><td>Maps look wrong</td><td>Could be legend layout, ROI parsing, coordinate scale, or old maps not overwritten.</td><td>Run Python-only post-processing, check map timestamps, and inspect <code>all_track_maps</code>.</td></tr>
+</table>
+<h3>Diagnostic ZIP command</h3>
+<p>If something fails, create a lightweight diagnostic bundle from inside the TOML folder. This does not copy the large video or trajectory arrays.</p>
+<pre><code>DEBUG_DIR="idtracker_debug_$(date +%Y%m%d_%H%M%S)"
+ZIP_NAME="${DEBUG_DIR}.zip"
+mkdir -p "$DEBUG_DIR"
+cp -r project_metadata "$DEBUG_DIR/" 2>/dev/null || true
+cp -r logs "$DEBUG_DIR/" 2>/dev/null || true
+find . -maxdepth 1 -name "*.toml" -exec cp {} "$DEBUG_DIR/" \;
+find postprocessing -type f \( -name "*.csv" -o -name "*.txt" -o -name "*.json" -o -name "*.png" \) -exec cp --parents {} "$DEBUG_DIR/" \; 2>/dev/null || true
+python -m zipfile -c "$ZIP_NAME" "$DEBUG_DIR"
+ls -lh "$ZIP_NAME"</code></pre>
+</section>
+
+<footer>
+<p>Guide written for the Firebird IDtracker.ai TOML-Folder Pipeline. Known-good architecture: three-stage SLURM workflow with IDtracker GPU array, session collector, and post-processing. Last updated for v13 partition-default fix.</p>
+</footer>
+</main>
+</body>
+</html>

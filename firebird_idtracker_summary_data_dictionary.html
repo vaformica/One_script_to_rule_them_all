@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Firebird IDtracker Post-processing Summary Data Dictionary</title>
+<style>
+:root {
+  --ink:#14213d; --muted:#52616b; --bg:#f7f9fb; --card:#ffffff; --line:#d9e2ec;
+  --accent:#1f6feb; --accent2:#0f766e; --warn:#9a3412; --soft:#eef6ff;
+}
+body { margin:0; font-family: Arial, Helvetica, sans-serif; background:var(--bg); color:#1f2933; line-height:1.55; }
+header { background:linear-gradient(135deg, #14213d, #1f6feb); color:white; padding:2.3rem 2rem; }
+header h1 { margin:0 0 .5rem 0; font-size:2rem; }
+header p { max-width:1050px; margin:.2rem 0; color:#e6f0ff; }
+main { max-width:1180px; margin:0 auto; padding:1.5rem; }
+.card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:1.2rem 1.35rem; margin:1rem 0; box-shadow:0 2px 10px rgba(20,33,61,.06); }
+h2 { color:var(--ink); border-bottom:3px solid var(--line); padding-bottom:.35rem; margin-top:0.8rem; }
+h3 { color:#243b53; margin-top:1.4rem; }
+h4 { color:#334e68; }
+.badge { display:inline-block; background:var(--soft); color:#0b4aa0; border:1px solid #b6d4fe; border-radius:999px; padding:.15rem .55rem; font-size:.86rem; font-weight:bold; }
+.callout { border-left:5px solid var(--accent2); background:#ecfdf5; padding:.8rem 1rem; border-radius:8px; margin:1rem 0; }
+.warning { border-left:5px solid var(--warn); background:#fff7ed; padding:.8rem 1rem; border-radius:8px; margin:1rem 0; }
+.file-list li { margin:.35rem 0; }
+code { background:#f1f5f9; padding:.05rem .25rem; border-radius:4px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+pre { background:#0b1220; color:#dbeafe; padding:1rem; border-radius:10px; overflow:auto; }
+table { border-collapse:collapse; width:100%; margin:1rem 0; background:white; }
+th, td { border:1px solid var(--line); padding:.55rem .65rem; vertical-align:top; }
+th { background:#e9f2ff; color:#102a43; text-align:left; position:sticky; top:0; }
+tr:nth-child(even) td { background:#fbfdff; }
+.toc a { display:inline-block; margin:.25rem .6rem .25rem 0; color:var(--accent); text-decoration:none; font-weight:bold; }
+.small { color:var(--muted); font-size:.95rem; }
+footer { text-align:center; color:var(--muted); padding:2rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Firebird IDtracker Post-processing Summary Data Dictionary</h1>
+  <p>Verbose reference for the combined BA and fight summary CSV files produced by the Firebird TOML-folder IDtracker pipeline.</p>
+  <p class="small">Generated 2026-07-07 03:07 for the Formica Lab Firebird workflow.</p>
+</header>
+<main>
+<section class="card toc">
+  <h2>Contents</h2>
+  <a href="#files">Summary files</a>
+  <a href="#provenance">Shared provenance columns</a>
+  <a href="#ba">BA individual summary</a>
+  <a href="#fight-individual">Fight individual summary</a>
+  <a href="#fight-pair">Fight pair summary</a>
+  <a href="#interpretation">Interpretation notes</a>
+  <a href="#missing">Missing values and QC</a>
+</section>
+
+<section class="card" id="files">
+  <h2>Which files this dictionary covers</h2>
+  <p>The pipeline writes one set of summary files inside the TOML folder under <code>postprocessing/</code>. These are the files most likely to be concatenated across many videos, cameras, days, acts, and arena cells.</p>
+  <ul class="file-list">
+    <li><code>postprocessing/ba_postprocessing/ba_individual_summary_all.csv</code>: one row per BA animal/session/cell. BA has one beetle per TOML.</li>
+    <li><code>postprocessing/fight_postprocessing/fight_individual_summary_all.csv</code>: one row per beetle in each fight cell. Fight TOMLs have two animals, so each cell usually contributes two rows.</li>
+    <li><code>postprocessing/fight_postprocessing/fight_pair_summary_all.csv</code>: one row per fight cell/session summarizing pairwise distance, contact, and possible fight-like close-contact events.</li>
+  </ul>
+  <p>The package may also write metadata-tagged copies of these files, such as <code>&lt;metadata_tag&gt;_fight_pair_summary_all.csv</code>. Those tagged copies contain the same columns as the generic files. The tag is included so the file remains interpretable if copied away from the TOML folder.</p>
+  <div class="callout"><strong>Recommended analysis practice:</strong> Use the generic summary files in scripted workflows, but preserve the metadata-tagged copies when manually moving files. Either way, every row contains source-video and TOML provenance columns.</div>
+</section>
+
+<section class="card" id="provenance">
+  <h2>Shared provenance columns in all summary files</h2>
+  <p>These columns are repeated in BA and fight summaries so every row remains traceable after concatenation. Treat these as the primary join keys and audit fields.</p>
+  <table class="dict-table"><thead><tr><th>Column</th><th>Type / unit</th><th>Meaning and interpretation</th></tr></thead><tbody>
+<tr><td><code>project_id</code></td><td>Text</td><td>Unique identifier generated for the TOML folder/video set. Usually combines the video/TOML-folder naming information. Use this as a project-level key, not as a biological measurement.</td></tr>
+<tr><td><code>project_name</code></td><td>Text</td><td>Name assigned to the TOML-folder run. Usually the name of the TOML folder or selected video stem.</td></tr>
+<tr><td><code>project_folder</code></td><td>Path</td><td>Absolute path to the TOML folder used by the GUI. This is the controlling folder for manifests, logs, moved IDtracker sessions, and post-processing outputs.</td></tr>
+<tr><td><code>metadata_tag</code></td><td>Text</td><td>Human-readable tag for the video/TOML set. In the current workflow this should preserve the original video identity so rows remain interpretable after copying or concatenating summary CSVs.</td></tr>
+<tr><td><code>pipeline</code></td><td>Text</td><td>Pipeline used for the row: `ba` for one-beetle behavioral assay or `fight` for two-beetle combat/fight processing.</td></tr>
+<tr><td><code>video_id</code></td><td>Text</td><td>Stable ID for the source video. Usually the source video stem.</td></tr>
+<tr><td><code>original_video_path</code></td><td>Path</td><td>Absolute path to the source AVI/MP4/MOV video referenced by the TOML. This is the primary raw-data provenance column.</td></tr>
+<tr><td><code>original_video_name</code></td><td>Text</td><td>Filename of the source video, including extension.</td></tr>
+<tr><td><code>original_video_stem</code></td><td>Text</td><td>Source video filename without extension. Used as the base of many output names.</td></tr>
+<tr><td><code>video_size_bytes</code></td><td>Integer</td><td>Size of the original video in bytes at import time. Useful for checking that the expected video was used.</td></tr>
+<tr><td><code>video_mtime_iso</code></td><td>Datetime</td><td>Last-modified timestamp of the original video at import time, in ISO-like format. Useful for provenance and sanity checks.</td></tr>
+<tr><td><code>cell_id</code></td><td>Text</td><td>Cell/arena identifier inferred from the TOML filename and/or GUI import grid. Multiple cells can come from the same source video.</td></tr>
+<tr><td><code>cell_label</code></td><td>Text</td><td>Editable arena/cell label such as A1, B3, C2. This should identify the physical arena within the video.</td></tr>
+<tr><td><code>cell_notes</code></td><td>Text</td><td>Optional notes about that TOML/cell from the import workflow.</td></tr>
+<tr><td><code>expected_animals</code></td><td>Integer</td><td>Expected number of animals for the selected pipeline. BA expects 1. Fight expects 2.</td></tr>
+<tr><td><code>toml_folder</code></td><td>Path</td><td>Folder containing the TOML files for this video.</td></tr>
+<tr><td><code>toml_path</code></td><td>Path</td><td>Absolute path to the specific TOML file used for this cell/arena.</td></tr>
+<tr><td><code>toml_name</code></td><td>Text</td><td>TOML filename, including `.toml`.</td></tr>
+<tr><td><code>toml_stem</code></td><td>Text</td><td>TOML filename without extension.</td></tr>
+<tr><td><code>toml_tracking_interval_start_frame</code></td><td>Integer</td><td>First frame of the IDtracker.ai tracking interval read from the TOML. This is the start used for analysis unless overridden.</td></tr>
+<tr><td><code>toml_tracking_interval_end_frame</code></td><td>Integer</td><td>Last frame of the IDtracker.ai tracking interval read from the TOML.</td></tr>
+<tr><td><code>toml_analysis_start_frame</code></td><td>Integer</td><td>Frame used by post-processing as the analysis start. Normally equals the first frame of the TOML tracking interval.</td></tr>
+<tr><td><code>output_stem</code></td><td>Text</td><td>Output naming key, generally `original_video_stem__cell_label`. This prevents collisions among multiple cells from one video.</td></tr>
+<tr><td><code>idtracker_session_name</code></td><td>Text</td><td>Name of the moved/organized IDtracker.ai session folder associated with this TOML/cell.</td></tr>
+</tbody></table>
+</section>
+
+<section class="card" id="ba">
+  <h2>BA individual summary: <code>ba_individual_summary_all.csv</code></h2>
+  <p>This file has one row per BA TOML/cell, because BA videos should contain one tracked beetle per TOML. It includes the shared provenance columns above plus the individual-movement columns below.</p>
+  <p><span class="badge">Biological unit</span> one beetle in one arena/cell from one original video.</p>
+  <table class="dict-table"><thead><tr><th>Column</th><th>Type / unit</th><th>Meaning and interpretation</th></tr></thead><tbody>
+<tr><td><code>session_name</code></td><td>Text</td><td>Session folder name used by the post-processing script. This may match the organized output stem or the original IDtracker.ai session folder name.</td></tr>
+<tr><td><code>animal_index_0_based</code></td><td>Integer</td><td>Animal index in the trajectory array. BA usually has only animal 0. Fight rows usually include animal 0 and animal 1.</td></tr>
+<tr><td><code>n_animals_in_file</code></td><td>Integer</td><td>Number of animals represented in the IDtracker trajectory file.</td></tr>
+<tr><td><code>analysis_start_frame</code></td><td>Integer</td><td>Global video frame where post-processing starts. This should usually match `toml_analysis_start_frame`.</td></tr>
+<tr><td><code>analysis_end_frame_inclusive</code></td><td>Integer</td><td>Last global video frame included in the analysis window.</td></tr>
+<tr><td><code>requested_window_frames</code></td><td>Integer or text</td><td>Requested analysis-window length. `all_available` means the script used all available frames after the start.</td></tr>
+<tr><td><code>actual_window_frames</code></td><td>Integer</td><td>Number of frames actually analyzed after cropping to the requested window and available data.</td></tr>
+<tr><td><code>first_valid_position_frame_local</code></td><td>Integer</td><td>First analyzed-frame index, relative to the analysis window, with a non-missing x/y position.</td></tr>
+<tr><td><code>first_valid_position_frame_global</code></td><td>Integer</td><td>First valid position expressed as original video frame number.</td></tr>
+<tr><td><code>last_valid_position_frame_local</code></td><td>Integer</td><td>Last analyzed-frame index, relative to the analysis window, with a non-missing x/y position.</td></tr>
+<tr><td><code>last_valid_position_frame_global</code></td><td>Integer</td><td>Last valid position expressed as original video frame number.</td></tr>
+<tr><td><code>valid_position_fraction_before_interpolation</code></td><td>Proportion</td><td>Fraction of frames with valid centroid positions before interpolation/artifact filling.</td></tr>
+<tr><td><code>n_missing_position_frames_raw</code></td><td>Integer</td><td>Number of missing centroid-position frames before interpolation.</td></tr>
+<tr><td><code>n_missing_position_frames_interpolated</code></td><td>Integer</td><td>Number of missing frames that were filled by interpolation.</td></tr>
+<tr><td><code>max_step_px_for_artifact_filter</code></td><td>Pixels</td><td>Frame-to-frame jump threshold used to identify implausible tracking jumps.</td></tr>
+<tr><td><code>n_artifact_jump_frames_interpolated</code></td><td>Integer</td><td>Number of large jump/artifact frames replaced by interpolation.</td></tr>
+<tr><td><code>n_total_interpolated_position_frames</code></td><td>Integer</td><td>Total number of position frames filled by interpolation, including missing frames and artifact jumps.</td></tr>
+<tr><td><code>n_unfilled_missing_position_frames_after_interpolation</code></td><td>Integer</td><td>Number of position frames that remained missing after interpolation.</td></tr>
+<tr><td><code>fraction_total_interpolated_position_frames</code></td><td>Proportion</td><td>Fraction of analyzed frames filled by interpolation.</td></tr>
+<tr><td><code>fraction_unfilled_missing_position_frames_after_interpolation</code></td><td>Proportion</td><td>Fraction of analyzed frames still missing after interpolation.</td></tr>
+<tr><td><code>move_threshold_px</code></td><td>Pixels</td><td>Displacement threshold used to classify movement onset relative to the first valid position.</td></tr>
+<tr><td><code>movement_onset_consecutive_frames</code></td><td>Frames</td><td>Number of consecutive frames required for sustained movement onset.</td></tr>
+<tr><td><code>latency_to_displacement_threshold_frames</code></td><td>Frames</td><td>Local-frame latency until displacement from the start position first exceeds `move_threshold_px`.</td></tr>
+<tr><td><code>global_frame_displacement_threshold_crossed</code></td><td>Frame</td><td>Original video frame where the displacement threshold was first crossed.</td></tr>
+<tr><td><code>latency_to_sustained_displacement_threshold_frames</code></td><td>Frames</td><td>Local-frame latency until displacement remains beyond threshold for the required number of consecutive frames.</td></tr>
+<tr><td><code>global_frame_sustained_displacement_threshold_crossed</code></td><td>Frame</td><td>Original video frame where sustained movement onset was detected.</td></tr>
+<tr><td><code>latency_to_cumulative_distance_threshold_frames</code></td><td>Frames</td><td>Local-frame latency until cumulative path length first exceeds `move_threshold_px`.</td></tr>
+<tr><td><code>global_frame_cumulative_threshold_crossed</code></td><td>Frame</td><td>Original video frame where cumulative-distance threshold was crossed.</td></tr>
+<tr><td><code>total_distance_px</code></td><td>Pixels</td><td>Total centroid path length across the analysis window, after filtering/interpolation.</td></tr>
+<tr><td><code>net_displacement_px</code></td><td>Pixels</td><td>Straight-line distance from first valid position to last valid position.</td></tr>
+<tr><td><code>max_displacement_from_start_px</code></td><td>Pixels</td><td>Maximum straight-line displacement from the first valid position during the analysis window.</td></tr>
+<tr><td><code>path_straightness_net_over_total</code></td><td>Unitless ratio</td><td>Net displacement divided by total path length. Values near 1 indicate relatively straight movement; values near 0 indicate wandering, looping, or little net displacement.</td></tr>
+<tr><td><code>speed_threshold_for_moving_px_per_frame</code></td><td>Pixels/frame</td><td>Per-frame speed threshold used to count moving frame-pairs. If not manually set, the script estimates a conservative threshold from the track.</td></tr>
+<tr><td><code>moving_frame_pairs</code></td><td>Integer</td><td>Number of consecutive frame-pairs whose step length meets or exceeds the speed threshold.</td></tr>
+<tr><td><code>moving_fraction_frame_pairs</code></td><td>Proportion</td><td>Fraction of available frame-pairs classified as moving.</td></tr>
+<tr><td><code>remaining_distance_after_displacement_threshold_px</code></td><td>Pixels</td><td>Total remaining path length after the first displacement-threshold crossing.</td></tr>
+<tr><td><code>available_frames_after_displacement_threshold</code></td><td>Frames</td><td>Number of frames available after the first displacement-threshold crossing.</td></tr>
+<tr><td><code>distance_per_available_frame_after_displacement_threshold_px</code></td><td>Pixels/frame</td><td>Remaining distance divided by available frames after first displacement-threshold crossing.</td></tr>
+<tr><td><code>remaining_distance_after_sustained_displacement_threshold_px</code></td><td>Pixels</td><td>Total remaining path length after sustained movement onset.</td></tr>
+<tr><td><code>available_frames_after_sustained_displacement_threshold</code></td><td>Frames</td><td>Number of frames available after sustained movement onset.</td></tr>
+<tr><td><code>distance_per_available_frame_after_sustained_displacement_threshold_px</code></td><td>Pixels/frame</td><td>Remaining distance divided by available frames after sustained movement onset.</td></tr>
+<tr><td><code>roi_wall_buffer_px</code></td><td>Pixels</td><td>Distance from the primary ROI wall used to define the border-buffer zone.</td></tr>
+<tr><td><code>primary_roi_name</code></td><td>Text</td><td>Name or label of the primary ROI from the TOML/session. This is the main arena/cell boundary.</td></tr>
+<tr><td><code>frames_inside_primary_roi</code></td><td>Frames</td><td>Number of analyzed frames where the centroid was inside the primary ROI.</td></tr>
+<tr><td><code>frames_in_primary_roi_border_buffer</code></td><td>Frames</td><td>Number of frames inside the primary ROI and within `roi_wall_buffer_px` of the ROI wall.</td></tr>
+<tr><td><code>frames_not_in_primary_roi_border_buffer</code></td><td>Frames</td><td>Number of frames inside the primary ROI and farther than the wall-buffer distance from the ROI boundary.</td></tr>
+<tr><td><code>fraction_frames_not_in_primary_roi_border_buffer_total</code></td><td>Proportion</td><td>Fraction of all analyzed frames spent inside the primary ROI but outside the border buffer.</td></tr>
+<tr><td><code>active_position_frames_after_displacement_threshold</code></td><td>Frames</td><td>Valid-position frames after the first displacement-threshold crossing.</td></tr>
+<tr><td><code>active_frames_in_primary_roi_border_buffer</code></td><td>Frames</td><td>Frames after first displacement-threshold crossing that were inside the ROI border buffer.</td></tr>
+<tr><td><code>active_frames_not_in_primary_roi_border_buffer</code></td><td>Frames</td><td>Frames after first displacement-threshold crossing that were inside the primary ROI but outside the border buffer.</td></tr>
+<tr><td><code>fraction_active_frames_in_primary_roi_border_buffer</code></td><td>Proportion</td><td>Among active-position frames after first threshold crossing, the fraction in the ROI border buffer.</td></tr>
+<tr><td><code>fraction_active_frames_not_in_primary_roi_border_buffer</code></td><td>Proportion</td><td>Among active-position frames after first threshold crossing, the fraction outside the ROI border buffer.</td></tr>
+<tr><td><code>active_position_frames_after_sustained_displacement_threshold</code></td><td>Frames</td><td>Valid-position frames after sustained movement onset.</td></tr>
+<tr><td><code>active_frames_in_primary_roi_border_buffer_after_sustained_threshold</code></td><td>Frames</td><td>Frames after sustained movement onset that were inside the ROI border buffer.</td></tr>
+<tr><td><code>active_frames_not_in_primary_roi_border_buffer_after_sustained_threshold</code></td><td>Frames</td><td>Frames after sustained movement onset that were inside the primary ROI but outside the border buffer.</td></tr>
+<tr><td><code>secondary_roi_name</code></td><td>Text</td><td>Name or label of the optional secondary ROI, if present. Often used for a biologically meaningful inner zone or region of interest.</td></tr>
+<tr><td><code>frames_inside_secondary_roi</code></td><td>Frames</td><td>Number of analyzed frames where the animal centroid was inside the secondary ROI.</td></tr>
+<tr><td><code>seconds_inside_secondary_roi</code></td><td>Seconds</td><td>Frames inside the secondary ROI divided by the `fps` parameter supplied to post-processing.</td></tr>
+<tr><td><code>fraction_frames_inside_secondary_roi_total</code></td><td>Proportion</td><td>Fraction of all analyzed frames spent inside the secondary ROI.</td></tr>
+<tr><td><code>turtling_detection_enabled</code></td><td>Boolean</td><td>Whether the turtling-like behavior detector was enabled for this run.</td></tr>
+<tr><td><code>turtling_event_count</code></td><td>Integer</td><td>Number of detected turtling-like centroid movement events.</td></tr>
+<tr><td><code>turtling_total_frames</code></td><td>Frames</td><td>Total frames classified as turtling-like.</td></tr>
+<tr><td><code>turtling_fraction_frames</code></td><td>Proportion</td><td>Fraction of analyzed frames classified as turtling-like.</td></tr>
+</tbody></table>
+</section>
+
+<section class="card" id="fight-individual">
+  <h2>Fight individual summary: <code>fight_individual_summary_all.csv</code></h2>
+  <p>This file uses the same individual-movement columns as the BA individual summary, but it is generated for each beetle in a two-beetle fight TOML. A normal fight cell should therefore contribute two rows: <code>animal_index_0_based = 0</code> and <code>animal_index_0_based = 1</code>.</p>
+  <p><span class="badge">Biological unit</span> one beetle within one fight arena/cell.</p>
+  <table class="dict-table"><thead><tr><th>Column</th><th>Type / unit</th><th>Meaning and interpretation</th></tr></thead><tbody>
+<tr><td><code>session_name</code></td><td>Text</td><td>Session folder name used by the post-processing script. This may match the organized output stem or the original IDtracker.ai session folder name.</td></tr>
+<tr><td><code>animal_index_0_based</code></td><td>Integer</td><td>Animal index in the trajectory array. BA usually has only animal 0. Fight rows usually include animal 0 and animal 1.</td></tr>
+<tr><td><code>n_animals_in_file</code></td><td>Integer</td><td>Number of animals represented in the IDtracker trajectory file.</td></tr>
+<tr><td><code>analysis_start_frame</code></td><td>Integer</td><td>Global video frame where post-processing starts. This should usually match `toml_analysis_start_frame`.</td></tr>
+<tr><td><code>analysis_end_frame_inclusive</code></td><td>Integer</td><td>Last global video frame included in the analysis window.</td></tr>
+<tr><td><code>requested_window_frames</code></td><td>Integer or text</td><td>Requested analysis-window length. `all_available` means the script used all available frames after the start.</td></tr>
+<tr><td><code>actual_window_frames</code></td><td>Integer</td><td>Number of frames actually analyzed after cropping to the requested window and available data.</td></tr>
+<tr><td><code>first_valid_position_frame_local</code></td><td>Integer</td><td>First analyzed-frame index, relative to the analysis window, with a non-missing x/y position.</td></tr>
+<tr><td><code>first_valid_position_frame_global</code></td><td>Integer</td><td>First valid position expressed as original video frame number.</td></tr>
+<tr><td><code>last_valid_position_frame_local</code></td><td>Integer</td><td>Last analyzed-frame index, relative to the analysis window, with a non-missing x/y position.</td></tr>
+<tr><td><code>last_valid_position_frame_global</code></td><td>Integer</td><td>Last valid position expressed as original video frame number.</td></tr>
+<tr><td><code>valid_position_fraction_before_interpolation</code></td><td>Proportion</td><td>Fraction of frames with valid centroid positions before interpolation/artifact filling.</td></tr>
+<tr><td><code>n_missing_position_frames_raw</code></td><td>Integer</td><td>Number of missing centroid-position frames before interpolation.</td></tr>
+<tr><td><code>n_missing_position_frames_interpolated</code></td><td>Integer</td><td>Number of missing frames that were filled by interpolation.</td></tr>
+<tr><td><code>max_step_px_for_artifact_filter</code></td><td>Pixels</td><td>Frame-to-frame jump threshold used to identify implausible tracking jumps.</td></tr>
+<tr><td><code>n_artifact_jump_frames_interpolated</code></td><td>Integer</td><td>Number of large jump/artifact frames replaced by interpolation.</td></tr>
+<tr><td><code>n_total_interpolated_position_frames</code></td><td>Integer</td><td>Total number of position frames filled by interpolation, including missing frames and artifact jumps.</td></tr>
+<tr><td><code>n_unfilled_missing_position_frames_after_interpolation</code></td><td>Integer</td><td>Number of position frames that remained missing after interpolation.</td></tr>
+<tr><td><code>fraction_total_interpolated_position_frames</code></td><td>Proportion</td><td>Fraction of analyzed frames filled by interpolation.</td></tr>
+<tr><td><code>fraction_unfilled_missing_position_frames_after_interpolation</code></td><td>Proportion</td><td>Fraction of analyzed frames still missing after interpolation.</td></tr>
+<tr><td><code>move_threshold_px</code></td><td>Pixels</td><td>Displacement threshold used to classify movement onset relative to the first valid position.</td></tr>
+<tr><td><code>movement_onset_consecutive_frames</code></td><td>Frames</td><td>Number of consecutive frames required for sustained movement onset.</td></tr>
+<tr><td><code>latency_to_displacement_threshold_frames</code></td><td>Frames</td><td>Local-frame latency until displacement from the start position first exceeds `move_threshold_px`.</td></tr>
+<tr><td><code>global_frame_displacement_threshold_crossed</code></td><td>Frame</td><td>Original video frame where the displacement threshold was first crossed.</td></tr>
+<tr><td><code>latency_to_sustained_displacement_threshold_frames</code></td><td>Frames</td><td>Local-frame latency until displacement remains beyond threshold for the required number of consecutive frames.</td></tr>
+<tr><td><code>global_frame_sustained_displacement_threshold_crossed</code></td><td>Frame</td><td>Original video frame where sustained movement onset was detected.</td></tr>
+<tr><td><code>latency_to_cumulative_distance_threshold_frames</code></td><td>Frames</td><td>Local-frame latency until cumulative path length first exceeds `move_threshold_px`.</td></tr>
+<tr><td><code>global_frame_cumulative_threshold_crossed</code></td><td>Frame</td><td>Original video frame where cumulative-distance threshold was crossed.</td></tr>
+<tr><td><code>total_distance_px</code></td><td>Pixels</td><td>Total centroid path length across the analysis window, after filtering/interpolation.</td></tr>
+<tr><td><code>net_displacement_px</code></td><td>Pixels</td><td>Straight-line distance from first valid position to last valid position.</td></tr>
+<tr><td><code>max_displacement_from_start_px</code></td><td>Pixels</td><td>Maximum straight-line displacement from the first valid position during the analysis window.</td></tr>
+<tr><td><code>path_straightness_net_over_total</code></td><td>Unitless ratio</td><td>Net displacement divided by total path length. Values near 1 indicate relatively straight movement; values near 0 indicate wandering, looping, or little net displacement.</td></tr>
+<tr><td><code>speed_threshold_for_moving_px_per_frame</code></td><td>Pixels/frame</td><td>Per-frame speed threshold used to count moving frame-pairs. If not manually set, the script estimates a conservative threshold from the track.</td></tr>
+<tr><td><code>moving_frame_pairs</code></td><td>Integer</td><td>Number of consecutive frame-pairs whose step length meets or exceeds the speed threshold.</td></tr>
+<tr><td><code>moving_fraction_frame_pairs</code></td><td>Proportion</td><td>Fraction of available frame-pairs classified as moving.</td></tr>
+<tr><td><code>remaining_distance_after_displacement_threshold_px</code></td><td>Pixels</td><td>Total remaining path length after the first displacement-threshold crossing.</td></tr>
+<tr><td><code>available_frames_after_displacement_threshold</code></td><td>Frames</td><td>Number of frames available after the first displacement-threshold crossing.</td></tr>
+<tr><td><code>distance_per_available_frame_after_displacement_threshold_px</code></td><td>Pixels/frame</td><td>Remaining distance divided by available frames after first displacement-threshold crossing.</td></tr>
+<tr><td><code>remaining_distance_after_sustained_displacement_threshold_px</code></td><td>Pixels</td><td>Total remaining path length after sustained movement onset.</td></tr>
+<tr><td><code>available_frames_after_sustained_displacement_threshold</code></td><td>Frames</td><td>Number of frames available after sustained movement onset.</td></tr>
+<tr><td><code>distance_per_available_frame_after_sustained_displacement_threshold_px</code></td><td>Pixels/frame</td><td>Remaining distance divided by available frames after sustained movement onset.</td></tr>
+<tr><td><code>roi_wall_buffer_px</code></td><td>Pixels</td><td>Distance from the primary ROI wall used to define the border-buffer zone.</td></tr>
+<tr><td><code>primary_roi_name</code></td><td>Text</td><td>Name or label of the primary ROI from the TOML/session. This is the main arena/cell boundary.</td></tr>
+<tr><td><code>frames_inside_primary_roi</code></td><td>Frames</td><td>Number of analyzed frames where the centroid was inside the primary ROI.</td></tr>
+<tr><td><code>frames_in_primary_roi_border_buffer</code></td><td>Frames</td><td>Number of frames inside the primary ROI and within `roi_wall_buffer_px` of the ROI wall.</td></tr>
+<tr><td><code>frames_not_in_primary_roi_border_buffer</code></td><td>Frames</td><td>Number of frames inside the primary ROI and farther than the wall-buffer distance from the ROI boundary.</td></tr>
+<tr><td><code>fraction_frames_not_in_primary_roi_border_buffer_total</code></td><td>Proportion</td><td>Fraction of all analyzed frames spent inside the primary ROI but outside the border buffer.</td></tr>
+<tr><td><code>active_position_frames_after_displacement_threshold</code></td><td>Frames</td><td>Valid-position frames after the first displacement-threshold crossing.</td></tr>
+<tr><td><code>active_frames_in_primary_roi_border_buffer</code></td><td>Frames</td><td>Frames after first displacement-threshold crossing that were inside the ROI border buffer.</td></tr>
+<tr><td><code>active_frames_not_in_primary_roi_border_buffer</code></td><td>Frames</td><td>Frames after first displacement-threshold crossing that were inside the primary ROI but outside the border buffer.</td></tr>
+<tr><td><code>fraction_active_frames_in_primary_roi_border_buffer</code></td><td>Proportion</td><td>Among active-position frames after first threshold crossing, the fraction in the ROI border buffer.</td></tr>
+<tr><td><code>fraction_active_frames_not_in_primary_roi_border_buffer</code></td><td>Proportion</td><td>Among active-position frames after first threshold crossing, the fraction outside the ROI border buffer.</td></tr>
+<tr><td><code>active_position_frames_after_sustained_displacement_threshold</code></td><td>Frames</td><td>Valid-position frames after sustained movement onset.</td></tr>
+<tr><td><code>active_frames_in_primary_roi_border_buffer_after_sustained_threshold</code></td><td>Frames</td><td>Frames after sustained movement onset that were inside the ROI border buffer.</td></tr>
+<tr><td><code>active_frames_not_in_primary_roi_border_buffer_after_sustained_threshold</code></td><td>Frames</td><td>Frames after sustained movement onset that were inside the primary ROI but outside the border buffer.</td></tr>
+<tr><td><code>secondary_roi_name</code></td><td>Text</td><td>Name or label of the optional secondary ROI, if present. Often used for a biologically meaningful inner zone or region of interest.</td></tr>
+<tr><td><code>frames_inside_secondary_roi</code></td><td>Frames</td><td>Number of analyzed frames where the animal centroid was inside the secondary ROI.</td></tr>
+<tr><td><code>seconds_inside_secondary_roi</code></td><td>Seconds</td><td>Frames inside the secondary ROI divided by the `fps` parameter supplied to post-processing.</td></tr>
+<tr><td><code>fraction_frames_inside_secondary_roi_total</code></td><td>Proportion</td><td>Fraction of all analyzed frames spent inside the secondary ROI.</td></tr>
+<tr><td><code>turtling_detection_enabled</code></td><td>Boolean</td><td>Whether the turtling-like behavior detector was enabled for this run.</td></tr>
+<tr><td><code>turtling_event_count</code></td><td>Integer</td><td>Number of detected turtling-like centroid movement events.</td></tr>
+<tr><td><code>turtling_total_frames</code></td><td>Frames</td><td>Total frames classified as turtling-like.</td></tr>
+<tr><td><code>turtling_fraction_frames</code></td><td>Proportion</td><td>Fraction of analyzed frames classified as turtling-like.</td></tr>
+</tbody></table>
+</section>
+
+<section class="card" id="fight-pair">
+  <h2>Fight pair summary: <code>fight_pair_summary_all.csv</code></h2>
+  <p>This file has one row per fight TOML/cell. It summarizes the relationship between the two beetles, including pairwise distance, contact/proximity events, and possible fight-like close-contact events.</p>
+  <p><span class="badge">Biological unit</span> one dyad in one fight arena/cell.</p>
+  <h3>Shared provenance columns</h3>
+  <p>The fight pair summary begins with the same shared provenance columns listed above, except that it does not have an animal index because the row describes the pair rather than one individual.</p>
+  <table class="dict-table"><thead><tr><th>Column</th><th>Type / unit</th><th>Meaning and interpretation</th></tr></thead><tbody>
+<tr><td><code>analysis_start_frame</code></td><td>Integer</td><td>Global frame where pairwise fight/contact analysis starts.</td></tr>
+<tr><td><code>actual_window_frames</code></td><td>Integer</td><td>Number of frames included in pairwise analysis.</td></tr>
+<tr><td><code>fps</code></td><td>Frames/second</td><td>Frame-rate value supplied to post-processing for converting frame counts to seconds. For timelapse workflows, set this carefully because seconds are computed from this value.</td></tr>
+<tr><td><code>contact_px</code></td><td>Pixels</td><td>Distance threshold between the two animals used to classify contact/proximity frames.</td></tr>
+<tr><td><code>min_contact_s</code></td><td>Seconds</td><td>Minimum duration, in seconds, required for a contact/proximity run to count as an event.</td></tr>
+<tr><td><code>min_contact_frames</code></td><td>Frames</td><td>`min_contact_s` converted to frames using `fps`, with a minimum of one frame.</td></tr>
+<tr><td><code>fight_px</code></td><td>Pixels</td><td>Stricter distance threshold used to classify very-close-contact candidate fight-like frames.</td></tr>
+<tr><td><code>min_fight_frames</code></td><td>Frames</td><td>Minimum consecutive frames required for a possible fight-like close-contact event.</td></tr>
+<tr><td><code>valid_pair_frames</code></td><td>Frames</td><td>Number of frames where both animals had valid positions and pairwise distance could be computed.</td></tr>
+<tr><td><code>fraction_valid_pair_frames</code></td><td>Proportion</td><td>Fraction of analyzed frames with valid positions for both animals.</td></tr>
+<tr><td><code>mean_pairwise_distance_px</code></td><td>Pixels</td><td>Mean centroid-to-centroid distance between the two animals across valid frames.</td></tr>
+<tr><td><code>median_pairwise_distance_px</code></td><td>Pixels</td><td>Median centroid-to-centroid distance between the two animals across valid frames.</td></tr>
+<tr><td><code>min_pairwise_distance_px</code></td><td>Pixels</td><td>Minimum centroid-to-centroid distance observed during the analysis window.</td></tr>
+<tr><td><code>contact_frame_count</code></td><td>Frames</td><td>Number of frames where animal distance was less than or equal to `contact_px`.</td></tr>
+<tr><td><code>contact_fraction_all_frames</code></td><td>Proportion</td><td>Fraction of all analyzed frames classified as contact/proximity.</td></tr>
+<tr><td><code>contact_event_count</code></td><td>Integer</td><td>Number of contact/proximity events after applying the minimum duration threshold.</td></tr>
+<tr><td><code>contact_total_duration_frames</code></td><td>Frames</td><td>Total duration of all contact/proximity events in frames.</td></tr>
+<tr><td><code>contact_total_duration_s</code></td><td>Seconds</td><td>Total duration of all contact/proximity events in seconds, computed using `fps`.</td></tr>
+<tr><td><code>possible_fight_frame_count</code></td><td>Frames</td><td>Number of frames where animal distance was less than or equal to `fight_px`.</td></tr>
+<tr><td><code>possible_fight_fraction_all_frames</code></td><td>Proportion</td><td>Fraction of analyzed frames classified as possible fight-like close contact.</td></tr>
+<tr><td><code>possible_fight_event_count</code></td><td>Integer</td><td>Number of possible fight-like close-contact events after applying `min_fight_frames`.</td></tr>
+<tr><td><code>possible_fight_total_duration_frames</code></td><td>Frames</td><td>Total duration of all possible fight-like close-contact events in frames.</td></tr>
+<tr><td><code>possible_fight_total_duration_s</code></td><td>Seconds</td><td>Total duration of possible fight-like close-contact events in seconds, computed using `fps`.</td></tr>
+<tr><td><code>secondary_roi_name</code></td><td>Text</td><td>Name or label of the optional secondary ROI used for pairwise zone metrics.</td></tr>
+<tr><td><code>both_animals_inside_secondary_roi_frames</code></td><td>Frames</td><td>Number of frames where both animals were inside the secondary ROI.</td></tr>
+<tr><td><code>either_animal_inside_secondary_roi_frames</code></td><td>Frames</td><td>Number of frames where at least one animal was inside the secondary ROI.</td></tr>
+<tr><td><code>contact_inside_secondary_roi_frames</code></td><td>Frames</td><td>Number of contact/proximity frames where both animals were inside the secondary ROI.</td></tr>
+<tr><td><code>session_name</code></td><td>Text</td><td>IDtracker session folder name used for the pairwise analysis row.</td></tr>
+</tbody></table>
+</section>
+
+<section class="card" id="interpretation">
+  <h2>Interpretation notes</h2>
+  <h3>Frames, seconds, and timelapse videos</h3>
+  <p>Columns ending in <code>_frames</code> are frame counts. Columns ending in <code>_s</code> are seconds computed from the <code>fps</code> value supplied to post-processing. If your biological sampling is effectively one frame per second, then 300 frames is roughly 300 seconds of biological time. Do not interpret frame counts as 30 fps video time unless the post-processing <code>fps</code> parameter was intentionally set that way for the analysis.</p>
+  <h3>Movement onset metrics</h3>
+  <p>The displacement-threshold latency columns ask when the animal first moved more than <code>move_threshold_px</code> away from its starting position. The sustained threshold is stricter because the animal must stay beyond threshold for <code>movement_onset_consecutive_frames</code>.</p>
+  <h3>Contact versus possible fight-like events</h3>
+  <p><code>contact_px</code> is a broader proximity threshold. <code>fight_px</code> is a stricter very-close-contact threshold. The script labels these as possible fight-like events because centroid proximity alone cannot prove a specific aggressive behavior without validation against scored video.</p>
+  <h3>Turtling-like events</h3>
+  <p>Turtling-like events are centroid-pattern detections, not direct posture classifications. They are intended to flag periods of compact, looping, low-net-displacement movement after movement onset. Treat them as candidate events that should be validated against video examples.</p>
+</section>
+
+<section class="card" id="missing">
+  <h2>Missing values and quality control</h2>
+  <ul>
+    <li><code>NaN</code> means the value could not be computed. Common reasons include no valid positions, no threshold crossing, no secondary ROI, or no event of that class.</li>
+    <li>High <code>fraction_total_interpolated_position_frames</code> means a large fraction of the trajectory was reconstructed rather than directly tracked. Review maps and session quality before trusting biological conclusions.</li>
+    <li>Low <code>fraction_valid_pair_frames</code> in fight summaries means pairwise distance metrics were computed from a limited subset of frames.</li>
+    <li>The safest row identifiers for joining and filtering are <code>original_video_stem</code>, <code>cell_label</code>, <code>toml_name</code>, <code>output_stem</code>, and <code>animal_index_0_based</code> for individual summaries.</li>
+  </ul>
+</section>
+</main>
+<footer>
+  Firebird IDtracker TOML-folder pipeline data dictionary.
+</footer>
+</body>
+</html>
