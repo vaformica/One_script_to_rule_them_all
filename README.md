@@ -28,6 +28,24 @@ conda activate idtrackerai
 conda install -c conda-forge pyqt -y
 ```
 
+
+### Install the one-line `process_tomls` command
+
+From the package directory on Firebird, run:
+
+```bash
+conda activate idtrackerai
+bash install_process_tomls_command.sh
+```
+
+After that, while the `idtrackerai` environment is active, launch the GUI from any directory with:
+
+```bash
+process_tomls
+```
+
+The command is installed inside that conda environment, not globally.
+
 ## Student workflow
 
 ### 1. Make TOMLs in idtracker.ai
@@ -53,7 +71,9 @@ Open the GUI and select:
 - the pipeline type: **Fight** for two animals or **BA** for one animal,
 - a metadata tag. If left blank, the package uses the original video stem.
 
-Click **Import / validate TOML folder**. The GUI creates a grid, one row per TOML.
+Choose either **Browse TOML folder** to import the whole folder or **Browse TOML file(s)** to import only one or several TOMLs from the same folder. Then click **Import / validate TOML folder**. The GUI creates a grid, one row per imported TOML.
+
+To include or exclude many rows at once, use **Shift-click** for a continuous range or **Ctrl-click / Command-click** for separate rows, then click **Remove selected TOML from run** or **Restore selected TOML to run**.
 
 The importer immediately checks whether each TOML appears to point to the selected video. If a hard mismatch is detected, it blocks the run and shows a clear mismatch dialog. Students should choose the correct video or TOML folder and import again.
 
@@ -207,3 +227,7 @@ Check per-cell post-processing status:
 ```bash
 cat postprocessing/fight_postprocessing/postprocessing_status_by_cell.csv
 ```
+
+### Rerun analysis without rerunning IDtracker.ai
+
+On the GUI's **Run** tab, use **Run post-processing only (CPU)** when the selected TOMLs already have completed sessions in `idtracker_sessions` and only the analysis needs to be regenerated. The GUI rebuilds the manifest from the TOMLs currently included in the table, submits one CPU SLURM job, overwrites the managed post-processing outputs, and skips both IDtracker.ai and session collection. Use the **Post-processing partition** field only when Firebird requires a named CPU partition; otherwise leave it blank to use the cluster default.

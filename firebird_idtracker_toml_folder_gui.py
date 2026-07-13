@@ -44,7 +44,7 @@ QT_BINDING = ""
 try:  # PyQt6
     from PyQt6.QtCore import QTimer, Qt
     from PyQt6.QtWidgets import (
-        QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QGridLayout,
+        QApplication, QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QGridLayout,
         QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
         QMessageBox, QPushButton, QSpinBox, QDoubleSpinBox, QTabWidget, QTableWidget,
         QTableWidgetItem, QTextEdit, QToolButton, QVBoxLayout, QWidget
@@ -54,7 +54,7 @@ except Exception:
     try:  # PySide6
         from PySide6.QtCore import QTimer, Qt
         from PySide6.QtWidgets import (
-            QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QGridLayout,
+            QApplication, QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QGridLayout,
             QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
             QMessageBox, QPushButton, QSpinBox, QDoubleSpinBox, QTabWidget, QTableWidget,
             QTableWidgetItem, QTextEdit, QToolButton, QVBoxLayout, QWidget
@@ -63,7 +63,7 @@ except Exception:
     except Exception:  # PyQt5 fallback
         from PyQt5.QtCore import QTimer, Qt  # type: ignore
         from PyQt5.QtWidgets import (  # type: ignore
-            QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QGridLayout,
+            QApplication, QAbstractItemView, QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QGridLayout,
             QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow,
             QMessageBox, QPushButton, QSpinBox, QDoubleSpinBox, QTabWidget, QTableWidget,
             QTableWidgetItem, QTextEdit, QToolButton, QVBoxLayout, QWidget
@@ -230,6 +230,7 @@ class MainWindow(QMainWindow):
         self.last_rows: List[Dict[str, str]] = []
         self.active_job_ids: List[str] = []
         self.active_toml_folder: Optional[Path] = None
+        self.selected_toml_files: List[Path] = []
         self.notified_completion = False
         self.lockable_widgets: List[QWidget] = []
 
@@ -272,8 +273,9 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(tab)
 
         info = QLabel(
-            "Select one source video and the folder containing all TOMLs made from that video. "
-            "Each TOML is treated as one arena/cell. The arena/cell label is inferred from the end of the TOML filename, such as A1 or B3, and can be edited in the grid."
+            "Select one source video, then either choose a whole TOML folder or choose one or several TOML files. "
+            "Each TOML is treated as one arena/cell. The arena/cell label is inferred from the end of the TOML filename, such as A1 or B3, and can be edited in the grid. "
+            "In the table, use Shift-click or Ctrl/Command-click to select multiple rows for exclusion or restoration."
         )
         info.setWordWrap(True)
         layout.addWidget(info)
@@ -297,7 +299,14 @@ class MainWindow(QMainWindow):
         self.browse_tomls_btn = QPushButton("Browse TOML folder")
         self.browse_tomls_btn.clicked.connect(self.browse_toml_folder)
         toml_row.addWidget(self.browse_tomls_btn)
-        form.addRow("TOML folder", toml_row)
+        self.browse_toml_files_btn = QPushButton("Browse TOML file(s)")
+        self.browse_toml_files_btn.clicked.connect(self.browse_toml_files)
+        toml_row.addWidget(self.browse_toml_files_btn)
+        form.addRow("TOML source", toml_row)
+
+        self.toml_selection_label = QLabel("Folder mode: all TOMLs in the selected folder will be imported.")
+        self.toml_selection_label.setWordWrap(True)
+        form.addRow("Selected TOMLs", self.toml_selection_label)
 
         self.pipeline_combo = QComboBox()
         self.pipeline_combo.addItem("Fight / combat: two beetles", "fight")
@@ -313,7 +322,7 @@ class MainWindow(QMainWindow):
         form.addRow("TOML search", self.recursive_check)
         layout.addWidget(form_box)
 
-        for w in [self.video_edit, self.browse_video_btn, self.toml_folder_edit, self.browse_tomls_btn,
+        for w in [self.video_edit, self.browse_video_btn, self.toml_folder_edit, self.browse_tomls_btn, self.browse_toml_files_btn,
                   self.pipeline_combo, self.metadata_tag_edit, self.recursive_check]:
             self.lockable_widgets.append(w)
 
@@ -349,6 +358,12 @@ class MainWindow(QMainWindow):
         self.table.setHorizontalHeaderLabels(GRID_COLUMNS)
         self.table.horizontalHeader().setSectionResizeMode(header_interactive())
         self.table.setAlternatingRowColors(True)
+        try:
+            self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        except AttributeError:
+            self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         layout.addWidget(self.table)
         self.lockable_widgets.append(self.table)
 
@@ -439,11 +454,22 @@ class MainWindow(QMainWindow):
         layout.addWidget(slurm_box)
 
         run_row = QHBoxLayout()
-        self.run_btn = QPushButton("Run SLURM pipeline")
+        self.run_btn = QPushButton("Run full pipeline (IDtracker + post-processing)")
         self.run_btn.setMinimumHeight(48)
+        self.run_btn.setToolTip("Runs IDtracker.ai on the included TOMLs, collects the resulting sessions, and then runs post-processing.")
         self.run_btn.clicked.connect(self.submit_slurm)
         run_row.addWidget(self.run_btn)
         self.lockable_widgets.append(self.run_btn)
+
+        self.postprocess_only_btn = QPushButton("Run post-processing only (CPU)")
+        self.postprocess_only_btn.setMinimumHeight(48)
+        self.postprocess_only_btn.setToolTip(
+            "Skips IDtracker.ai and reruns only the Python post-processing analysis on existing "
+            "idtracker_sessions. The job requests no GPU."
+        )
+        self.postprocess_only_btn.clicked.connect(self.submit_postprocessing_only)
+        run_row.addWidget(self.postprocess_only_btn)
+        self.lockable_widgets.append(self.postprocess_only_btn)
         self.running_label = QLabel("Not running.")
         run_row.addWidget(self.running_label)
         layout.addLayout(run_row)
@@ -534,9 +560,36 @@ class MainWindow(QMainWindow):
     def browse_toml_folder(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select TOML folder")
         if path:
+            self.selected_toml_files = []
             self.toml_folder_edit.setText(path)
+            self.toml_selection_label.setText("Folder mode: all TOMLs in the selected folder will be imported.")
             if not self.metadata_tag_edit.text().strip():
                 self.metadata_tag_edit.setText(Path(path).name)
+
+    def browse_toml_files(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Select one or more TOML files", "", "TOML files (*.toml);;All files (*)"
+        )
+        if not paths:
+            return
+        selected = [Path(x).expanduser().resolve() for x in paths]
+        parents = {p.parent for p in selected}
+        if len(parents) != 1:
+            QMessageBox.warning(
+                self, "TOMLs must share a folder",
+                "For a single run, the selected TOML files must be in the same folder. "
+                "Move/copy them into one folder or select each folder as a separate run."
+            )
+            return
+        self.selected_toml_files = selected
+        folder = selected[0].parent
+        self.toml_folder_edit.setText(str(folder))
+        names = ", ".join(p.name for p in selected[:6])
+        if len(selected) > 6:
+            names += f", plus {len(selected) - 6} more"
+        self.toml_selection_label.setText(f"File mode: {len(selected)} selected TOML file(s): {names}")
+        if not self.metadata_tag_edit.text().strip():
+            self.metadata_tag_edit.setText(folder.name)
 
     def _has_trajectory(self, folder: Path) -> bool:
         if not folder.exists():
@@ -705,6 +758,8 @@ class MainWindow(QMainWindow):
                     self.log(f"Could not remove package metadata file {p}: {exc}")
         self.video_edit.clear()
         self.toml_folder_edit.clear()
+        self.selected_toml_files = []
+        self.toml_selection_label.setText("Folder mode: all TOMLs in the selected folder will be imported.")
         self.table.setRowCount(0)
         self.last_rows = []
         self.import_summary.setText("Selection cleared. Choose the correct video and TOML folder, then import again.")
@@ -764,7 +819,10 @@ class MainWindow(QMainWindow):
         cmd = [sys.executable, str(MANAGER), "import", "--video", video, "--toml-folder", folder, "--pipeline", pipeline]
         if tag:
             cmd += ["--metadata-tag", tag]
-        if self.recursive_check.isChecked():
+        if self.selected_toml_files:
+            for toml_file in self.selected_toml_files:
+                cmd += ["--toml-file", str(toml_file)]
+        elif self.recursive_check.isChecked():
             cmd += ["--recursive"]
         self.log("Running: " + " ".join(shlex.quote(x) for x in cmd))
         res = run_cmd(cmd)
@@ -796,43 +854,48 @@ class MainWindow(QMainWindow):
             return
         self.load_grid()
 
-    def selected_row(self) -> Optional[Dict[str, str]]:
-        r = self.table.currentRow()
-        if r < 0 or r >= len(self.last_rows):
-            return None
-        return self.last_rows[r]
+    def selected_rows(self) -> List[Dict[str, str]]:
+        selected_indexes = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        row_numbers = sorted({idx.row() for idx in selected_indexes})
+        if not row_numbers:
+            current = self.table.currentRow()
+            if current >= 0:
+                row_numbers = [current]
+        return [self.last_rows[r] for r in row_numbers if 0 <= r < len(self.last_rows)]
 
     def set_selected_toml_run_status(self, include: bool) -> None:
-        row = self.selected_row()
-        if not row:
-            QMessageBox.warning(self, "No selection", "Select a TOML row first.")
+        rows = self.selected_rows()
+        if not rows:
+            QMessageBox.warning(self, "No selection", "Select one or more TOML rows first.")
             return
         folder = self.current_toml_folder()
         if not folder:
             QMessageBox.warning(self, "Missing TOML folder", "Select/import a TOML folder first.")
             return
-        toml_path = row.get("toml_path", "")
+        paths = [row.get("toml_path", "") for row in rows if row.get("toml_path", "")]
+        count = len(paths)
+        preview = "\n".join(paths[:10])
+        if count > 10:
+            preview += f"\n... plus {count - 10} more"
         if include:
-            title = "Restore TOML to run?"
-            msg = f"Restore this TOML to the next SLURM/post-processing run?\n\n{toml_path}"
+            title = f"Restore {count} TOML file(s) to run?"
+            msg = f"Restore the selected TOML file(s) to the next SLURM/post-processing run?\n\n{preview}"
             include_value = "YES"
         else:
-            title = "Remove TOML from run?"
+            title = f"Remove {count} TOML file(s) from run?"
             msg = (
-                "Remove this TOML from consideration for the next run?\n\n"
-                "The TOML file will NOT be deleted. Existing IDtracker sessions and post-processing outputs will also be left alone.\n\n"
-                f"{toml_path}"
+                "Remove the selected TOML file(s) from consideration for the next run?\n\n"
+                "The TOML files will NOT be deleted. Existing IDtracker sessions and post-processing outputs will also be left alone.\n\n"
+                f"{preview}"
             )
             include_value = "NO"
         reply = QMessageBox.question(self, title, msg)
         if reply != qt_checked_yes():
             return
-        res = run_cmd([
-            sys.executable, str(MANAGER), "set-run-status",
-            "--toml-folder", str(folder),
-            "--toml-path", toml_path,
-            "--include", include_value,
-        ])
+        cmd = [sys.executable, str(MANAGER), "set-run-status", "--toml-folder", str(folder), "--include", include_value]
+        for toml_path in paths:
+            cmd += ["--toml-path", toml_path]
+        res = run_cmd(cmd)
         self.log(res.stdout.strip())
         if res.returncode != 0:
             QMessageBox.critical(self, "Run-status update failed", res.stderr or res.stdout)
@@ -845,6 +908,115 @@ class MainWindow(QMainWindow):
             return
         self.log(f"TOML folder: {folder}")
         subprocess.Popen(["xdg-open", str(folder)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def submit_postprocessing_only(self) -> None:
+        """Submit only the CPU post-processing stage for the included TOMLs.
+
+        This intentionally skips both IDtracker.ai and session collection. It
+        expects the matching completed session folders to already exist under
+        <TOML folder>/idtracker_sessions.
+        """
+        folder = self.current_toml_folder()
+        if not folder:
+            QMessageBox.warning(self, "Missing TOML folder", "Select/import a TOML folder first.")
+            return
+        if self.last_rows:
+            self.save_grid_edits()
+
+        cmd = [sys.executable, str(MANAGER), "build-manifest", "--toml-folder", str(folder)]
+        if self.strict_check.isChecked():
+            cmd.append("--strict")
+        res = run_cmd(cmd)
+        self.log(res.stdout.strip())
+        if res.stderr.strip():
+            self.log(res.stderr.strip())
+        if res.returncode != 0:
+            QMessageBox.critical(self, "Manifest failed", res.stderr or res.stdout)
+            return
+
+        manifest = self.manifest_path()
+        n = 0
+        if manifest and manifest.exists():
+            with manifest.open(newline="", encoding="utf-8") as f:
+                n = sum(1 for _ in csv.DictReader(f))
+        if n == 0:
+            QMessageBox.warning(
+                self,
+                "No runnable TOMLs",
+                "The manifest has zero runnable rows. Include at least one valid TOML or turn off strict mode.",
+            )
+            return
+
+        session_root = folder / "idtracker_sessions"
+        if not session_root.exists():
+            QMessageBox.warning(
+                self,
+                "No collected sessions found",
+                f"Post-processing-only mode requires existing IDtracker sessions in:\n{session_root}\n\n"
+                "No IDtracker job was submitted.",
+            )
+            return
+
+        export_common = {
+            "TOML_ROOT": str(folder),
+            "PROJECT_DIR": str(folder),
+            "SESSION_OUTPUT_ROOT": str(session_root),
+            "POSTPROCESS_OUTPUT_ROOT": str(folder / "postprocessing"),
+            "PACKAGE_DIR": str(PACKAGE_DIR),
+            "METADATA_MANIFEST": str(manifest),
+            "CONDA_ENV": self.conda_env.text().strip() or "idtrackerai",
+            "CONDA_INIT": self.conda_init.text().strip(),
+            "WINDOW_FRAMES": str(self.window_frames.value()),
+            "FPS": str(self.fps.value()),
+            "MOVE_THRESHOLD_PX": str(self.move_threshold.value()),
+            "MOVEMENT_ONSET_CONSECUTIVE_FRAMES": str(self.movement_onset.value()),
+            "MAX_STEP_PX": str(self.max_step.value()),
+            "ROI_WALL_BUFFER_PX": str(self.roi_wall_buffer.value()),
+            "TURTLING_WINDOW_FRAMES": str(self.turtling_window.value()),
+            "TURTLING_MIN_DURATION_FRAMES": str(self.turtling_min.value()),
+            "CONTACT_PX": str(self.contact_px.value()),
+            "MIN_CONTACT_S": str(self.min_contact_s.value()),
+            "FIGHT_PX": str(self.fight_px.value()),
+            "MIN_FIGHT_FRAMES": str(self.min_fight_frames.value()),
+            "ANALYSIS_START_FRAME": "-1",
+        }
+        export_post = ",".join(
+            ["ALL", "MODE=postprocess"]
+            + [f"{k}={quote_export(v)}" for k, v in export_common.items()]
+        )
+        post_args = postprocess_sbatch_args(self.post_partition.text())
+        post_cmd = [
+            "sbatch",
+            *post_args,
+            "--job-name=idtracker_postprocess_cpu",
+            "--chdir",
+            str(folder),
+            f"--export={export_post}",
+            str(SLURM_SCRIPT),
+        ]
+        self.log("Submitting CPU post-processing-only job: " + " ".join(shlex.quote(x) for x in post_cmd))
+        post_res = run_cmd(post_cmd, cwd=folder)
+        self.log(post_res.stdout.strip())
+        if post_res.stderr.strip():
+            self.log(post_res.stderr.strip())
+        if post_res.returncode != 0:
+            QMessageBox.critical(self, "Post-processing submission failed", post_res.stderr or post_res.stdout)
+            return
+
+        post_job_id = parse_job_id(post_res.stdout)
+        self.active_toml_folder = folder
+        self.active_job_ids = [j for j in [post_job_id] if j]
+        self.notified_completion = False
+        self.save_run_state("", post_job_id, n, collect_job_id="")
+        self.set_running_state(True)
+        QMessageBox.information(
+            self,
+            "Post-processing submitted",
+            f"Submitted CPU post-processing job {post_job_id or 'unknown'} for {n} included TOML(s).\n\n"
+            "IDtracker.ai was not run and no GPU was requested.",
+        )
+        self.refresh_squeue()
+        self.tabs.setCurrentIndex(2)
 
     def submit_slurm(self) -> None:
         folder = self.current_toml_folder()

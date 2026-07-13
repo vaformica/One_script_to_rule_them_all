@@ -26,7 +26,7 @@ from pathlib import Path
 import re
 import shlex
 import sys
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 try:
     import tomllib  # Python 3.11+
@@ -293,7 +293,7 @@ def mismatch_summary(rows: List[Dict[str, str]], max_rows: int = 20) -> str:
     return "\n".join(lines)
 
 
-def import_toml_folder(toml_folder: Path, video: Path, pipeline: str, metadata_tag: str = "", recursive: bool = False) -> List[Dict[str, str]]:
+def import_toml_folder(toml_folder: Path, video: Path, pipeline: str, metadata_tag: str = "", recursive: bool = False, selected_tomls: Optional[List[Path]] = None) -> List[Dict[str, str]]:
     toml_folder = toml_folder.expanduser().resolve()
     video = video.expanduser().resolve()
     if not toml_folder.is_dir():
@@ -320,6 +320,7 @@ def import_toml_folder(toml_folder: Path, video: Path, pipeline: str, metadata_t
         "pipeline": pipeline,
         "registered_video": v,
         "recursive_toml_search": bool(recursive),
+        "selected_toml_paths": [str(Path(x).expanduser().resolve()) for x in (selected_tomls or [])],
         "updated_at": now_iso(),
     }
     config_path(toml_folder).write_text(json.dumps(config, indent=2), encoding="utf-8")
@@ -335,9 +336,15 @@ def import_toml_folder(toml_folder: Path, video: Path, pipeline: str, metadata_t
         if key:
             previous_by_path[key] = old
 
-    tomls = sorted(toml_folder.rglob("*.toml") if recursive else toml_folder.glob("*.toml"))
-    # Do not import TOMLs inside managed output folders if recursive is on.
-    tomls = [p for p in tomls if "project_metadata" not in p.parts and "idtracker_sessions" not in p.parts and "postprocessing" not in p.parts]
+    if selected_tomls:
+        tomls = sorted({Path(x).expanduser().resolve() for x in selected_tomls})
+        bad = [p for p in tomls if not p.is_file() or p.suffix.lower() != ".toml"]
+        if bad:
+            raise SystemExit("Selected TOML file(s) do not exist or are not .toml files: " + ", ".join(str(p) for p in bad))
+    else:
+        tomls = sorted(toml_folder.rglob("*.toml") if recursive else toml_folder.glob("*.toml"))
+        # Do not import TOMLs inside managed output folders if recursive is on.
+        tomls = [p for p in tomls if "project_metadata" not in p.parts and "idtracker_sessions" not in p.parts and "postprocessing" not in p.parts]
     rows = []
     expected = "1" if pipeline == "ba" else "2"
     for i, t in enumerate(tomls, start=1):
@@ -472,6 +479,7 @@ def refresh(toml_folder: Path) -> List[Dict[str, str]]:
         pipeline=cfg["pipeline"],
         metadata_tag=cfg.get("metadata_tag", ""),
         recursive=bool(cfg.get("recursive_toml_search", False)),
+        selected_tomls=[Path(x) for x in cfg.get("selected_toml_paths", [])],
     )
 
 
@@ -489,24 +497,25 @@ def build_manifest(toml_folder: Path, include_warnings: bool = True) -> List[Dic
     return runnable
 
 
-def set_run_status(toml_folder: Path, toml_path: Path, include: bool) -> None:
+def set_run_status(toml_folder: Path, toml_paths: List[Path], include: bool) -> None:
     """Mark a TOML as included/excluded without deleting the TOML file."""
     grid = all_tomls_path(toml_folder.expanduser().resolve())
     rows = read_csv(grid)
     if not rows:
         raise SystemExit("No imported TOML grid found. Import/validate the TOML folder first.")
-    target = str(toml_path.expanduser().resolve())
-    changed = False
+    targets = {str(p.expanduser().resolve()) for p in toml_paths}
+    changed = set()
     for r in rows:
         try:
             key = str(Path(r.get("toml_path", "")).expanduser().resolve())
         except Exception:
             key = r.get("toml_path", "")
-        if key == target:
+        if key in targets:
             r["run_this_toml"] = "YES" if include else "NO"
-            changed = True
-    if not changed:
-        raise SystemExit(f"TOML path was not found in the import grid: {target}")
+            changed.add(key)
+    missing = sorted(targets - changed)
+    if missing:
+        raise SystemExit("TOML path(s) not found in the import grid: " + ", ".join(missing))
     rows = validate_rows(rows)
     write_csv(grid, rows)
 
@@ -555,6 +564,7 @@ def main() -> int:
     p_imp.add_argument("--pipeline", choices=["ba", "fight"], required=True)
     p_imp.add_argument("--metadata-tag", default="")
     p_imp.add_argument("--recursive", action="store_true")
+    p_imp.add_argument("--toml-file", action="append", default=[], help="Import only this TOML file. Repeat for multiple files.")
 
     p_ref = sub.add_parser("refresh")
     p_ref.add_argument("--toml-folder", required=True)
@@ -573,12 +583,15 @@ def main() -> int:
 
     p_run = sub.add_parser("set-run-status")
     p_run.add_argument("--toml-folder", required=True)
-    p_run.add_argument("--toml-path", required=True)
+    p_run.add_argument("--toml-path", action="append", required=True)
     p_run.add_argument("--include", choices=["YES", "NO"], required=True)
 
     args = ap.parse_args()
     if args.cmd == "import":
-        rows = import_toml_folder(Path(args.toml_folder), Path(args.video), args.pipeline, args.metadata_tag, args.recursive)
+        rows = import_toml_folder(
+            Path(args.toml_folder), Path(args.video), args.pipeline, args.metadata_tag, args.recursive,
+            selected_tomls=[Path(x) for x in args.toml_file],
+        )
         counts = {}
         for r in rows:
             counts[r["validation_status"]] = counts.get(r["validation_status"], 0) + 1
@@ -603,8 +616,12 @@ def main() -> int:
         return 0
     if args.cmd == "set-run-status":
         include = str(args.include).upper() == "YES"
-        set_run_status(Path(args.toml_folder), Path(args.toml_path), include=include)
-        print("Marked TOML as included in run." if include else "Removed TOML from run. The TOML file was not deleted.")
+        paths = [Path(x) for x in args.toml_path]
+        set_run_status(Path(args.toml_folder), paths, include=include)
+        print(
+            f"Marked {len(paths)} TOML file(s) as included in run." if include
+            else f"Removed {len(paths)} TOML file(s) from run. The TOML files were not deleted."
+        )
         return 0
     return 1
 
