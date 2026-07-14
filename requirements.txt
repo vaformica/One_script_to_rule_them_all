@@ -1,3 +1,4 @@
-# Use the idtrackerai conda environment. Install one Qt binding if needed:
-# conda install -c conda-forge pyqt -y
-# Python >= 3.11 is preferred because tomllib is built in.
+streamlit>=1.36
+pandas>=2.1
+tomlkit>=0.12
+Pillow>=10.0
