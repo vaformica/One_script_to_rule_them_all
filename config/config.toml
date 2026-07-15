@@ -9,9 +9,13 @@ ssh_host = "firebird"
 remote_project_root = "/data/labs/vformic1-swat-lab/idtracker_pipeline"
 remote_video_roots = [
   "/data/labs/vformic1-swat-lab/2026_Video"
+  "/data/labs/vformic1-swat-lab/2025_Video"
+
 ]
 remote_toml_roots = [
-  "/data/labs/vformic1-swat-lab/2026_TOMLs"
+  "/data/labs/vformic1-swat-lab/2026_IDTracker_Files"
+  "/data/labs/vformic1-swat-lab/2025_IDTracker_Files"
+
 ]
 
 [commands]
