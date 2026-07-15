@@ -1,4 +1,0 @@
-streamlit>=1.36
-pandas>=2.1
-tomlkit>=0.12
-Pillow>=10.0

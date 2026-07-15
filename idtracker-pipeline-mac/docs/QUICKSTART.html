@@ -1,0 +1,38 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>IDtracker Mac/SSH Controller</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;max-width:950px;margin:2rem auto;padding:0 1rem;line-height:1.55}
+pre{background:#f4f5f7;padding:1rem;border-radius:7px}
+.warn{background:#fff4ce;border-left:5px solid #c99600;padding:1rem}
+</style>
+</head>
+<body>
+<h1>IDtracker Mac/SSH Controller</h1>
+<h2>Install</h2>
+<pre>bash scripts/install_mac.sh
+bash scripts/launch_mac.sh</pre>
+<h2>Configure</h2>
+<ol>
+<li>Test the SSH alias and private key.</li>
+<li>Set the Firebird recursive search root.</li>
+<li>Set the remote run root.</li>
+<li>Enter the exact paths to the proven SLURM scripts.</li>
+<li>Verify the script paths.</li>
+</ol>
+<h2>Use</h2>
+<ol>
+<li>Scan Firebird recursively.</li>
+<li>Review matched and ambiguous rows.</li>
+<li>Edit TOML thresholds only when necessary.</li>
+<li>Submit one test row.</li>
+<li>Review the exact sbatch command and job state.</li>
+</ol>
+<div class="warn">
+The existing Firebird scripts must use the exported PIPELINE_* variables or
+search the run-specific input directory. Test one TOML before a large batch.
+</div>
+</body>
+</html>

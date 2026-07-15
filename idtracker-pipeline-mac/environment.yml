@@ -1,0 +1,9 @@
+name: idtracker_controller_mac
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pyqt=5
+  - pandas
+  - tomlkit
+  - pillow
