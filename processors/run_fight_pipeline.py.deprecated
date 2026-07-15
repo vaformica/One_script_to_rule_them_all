@@ -1,0 +1,68 @@
+from __future__ import annotations
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+from collector.metadata_injector import enrich_tree
+from pipeline.run_metadata import RunMetadata
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--session-path", required=True)
+    parser.add_argument("--output-root", required=True)
+    parser.add_argument("--run-metadata-json", required=True)
+    parser.add_argument(
+        "--batch-script",
+        default=str(
+            Path(__file__).resolve().parents[1]
+            / "analysis/fights/run_idtracker_combat_batch.py"
+        ),
+    )
+    parser.add_argument(
+        "--analysis-script",
+        default=str(
+            Path(__file__).resolve().parents[1]
+            / "analysis/fights/analyze_idtracker_combat.py"
+        ),
+    )
+    parser.add_argument("--window-frames", type=int, default=7200)
+    parser.add_argument("--fps", type=float, default=30)
+    parser.add_argument("--contact-px", type=float, default=60)
+    parser.add_argument("--min-contact-s", type=float, default=0.2)
+    parser.add_argument("--fight-px", type=float, default=35)
+    parser.add_argument("--min-fight-frames", type=int, default=6)
+    parser.add_argument("--move-threshold-px", type=float, default=30)
+    parser.add_argument("--movement-onset-consecutive-frames", type=int, default=30)
+    parser.add_argument("--roi-wall-buffer-px", type=float, default=30)
+    parser.add_argument("--max-step-px", type=float, default=50)
+    args = parser.parse_args()
+
+    command = [
+        sys.executable,
+        args.batch_script,
+        "--search-root", args.session_path,
+        "--analysis-script", args.analysis_script,
+        "--output-root", args.output_root,
+        "--analysis-start-frame", "0",
+        "--window-frames", str(args.window_frames),
+        "--fps", str(args.fps),
+        "--contact-px", str(args.contact_px),
+        "--min-contact-s", str(args.min_contact_s),
+        "--fight-px", str(args.fight_px),
+        "--min-fight-frames", str(args.min_fight_frames),
+        "--move-threshold-px", str(args.move_threshold_px),
+        "--movement-onset-consecutive-frames",
+        str(args.movement_onset_consecutive_frames),
+        "--roi-wall-buffer-px", str(args.roi_wall_buffer_px),
+        "--max-step-px", str(args.max_step_px),
+        "--overwrite",
+    ]
+    subprocess.run(command, check=True)
+    metadata = RunMetadata.from_json(args.run_metadata_json)
+    print(enrich_tree(Path(args.output_root), metadata))
+
+
+if __name__ == "__main__":
+    main()

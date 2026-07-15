@@ -1,0 +1,12 @@
+name: beetle_pipeline
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - matplotlib
+  - h5py
+  - scipy
+  - pillow
+  - tomlkit
