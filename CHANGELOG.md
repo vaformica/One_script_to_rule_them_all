@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.8.2
+- Leave canonical IDtracker sessions exactly where IDtracker creates them.
+- Remove all session copying and moving from tracking jobs.
+- Record only `session_path.txt` and `session_link.txt` in immutable run folders.
+- Mark archive status as `DEFERRED`; session management can be performed later as a separate operation.
+- Remove the session-archive checkbox from the GUI.
+
+
+## 0.8.0
+- Decoupled tracking, postprocessing, archiving, and QC.
+- Added deterministic canonical session resolution from TOML video path and name.
+- Added postprocessing-only submission mode.
+- Added Check All, Uncheck All, and Invert Selection.
+- Added GUI BA and fight parameter editor.
+- Added optional nonfatal session archive and permanent session_link.txt.
+- Added QC/run_status.csv, consolidated summaries, track maps, and QC_Report.html.
+
+# Changelog
+
 ## 0.7.2
 
 - Fixed headless SLURM execution by adding the required `--track` flag.
@@ -60,3 +79,20 @@
 ## 0.4.0
 
 - Unified Mac GUI, Firebird execution, metadata, and collector.
+
+## 0.8.1
+
+- Removed the runtime dependency on `tomlkit` from session discovery.
+- Validate tracking success from the canonical session contents rather than relying only on the `idtrackerai` process exit code.
+- Preserve nonzero IDtracker exit codes as warnings when a complete session exists.
+- Default postprocessing and collection to the `beetle_pipeline` Conda environment.
+- Run the collector after any postprocessing outcome so failed analyses are recorded in QC.
+
+## 0.8.3
+
+- Session discovery now follows one deterministic rule: read the video path and session name from the TOML, then use `<video directory>/session_<name>`.
+- The TOML file's directory and pipeline run directory are no longer used to infer session location.
+- Multiline `video_paths` arrays are parsed without third-party TOML packages.
+- Session errors now print the TOML, encoded video path, expected session path, and exact missing files.
+- Added `INSTALL_UPDATE.command`, a one-step Mac-to-Firebird installer for the working repository.
+- Existing Mac and Firebird Conda environments are reused and are not recreated during routine code updates.

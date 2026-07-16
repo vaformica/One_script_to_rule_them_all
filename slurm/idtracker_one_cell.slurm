@@ -6,34 +6,51 @@
 #SBATCH --mem=32G
 #SBATCH --gres=gpu:1
 
-set -euo pipefail
+set -uo pipefail
 
-: "${PIPELINE_TOML:?PIPELINE_TOML is required}"
-: "${PIPELINE_RUN_DIR:?PIPELINE_RUN_DIR is required}"
-: "${PIPELINE_SESSION_OUTPUT_DIR:?PIPELINE_SESSION_OUTPUT_DIR is required}"
+: "${PIPELINE_REPO_ROOT:?}"
+: "${PIPELINE_TOML:?}"
+: "${PIPELINE_RUN_DIR:?}"
+
+mkdir -p "$PIPELINE_RUN_DIR/logs" "$PIPELINE_RUN_DIR/status"
+printf 'Running IDtracker\n' > "$PIPELINE_RUN_DIR/status/stage.txt"
 
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate "${IDTRACKER_CONDA_ENV:-idtrackerai}"
 
-mkdir -p "$PIPELINE_RUN_DIR/logs" "$PIPELINE_SESSION_OUTPUT_DIR"
-cd "$PIPELINE_SESSION_OUTPUT_DIR"
-
-# IDtracker.ai 6.x headless invocation.
-#
-# --load reads the TOML.
-# --track bypasses the segmentation GUI and starts tracking directly.
-# Without --track, IDtracker tries to launch Qt, which fails on a headless
-# SLURM compute node with "could not connect to display".
+# Some idtracker.ai releases can return a nonzero code after having written a
+# complete, valid session. Do not decide success from the process code alone.
 idtrackerai --track --load "$PIPELINE_TOML"
+IDTRACKER_RC=$?
+printf '%s\n' "$IDTRACKER_RC" > "$PIPELINE_RUN_DIR/status/idtracker_exit_code.txt"
 
-# Find the newest session directory produced by this job.
-SESSION_PATH="$(
-  find "$PIPELINE_SESSION_OUTPUT_DIR" -maxdepth 2 -type d -name 'session_*' \
-    -printf '%T@\t%p\n' | sort -nr | head -1 | cut -f2-
-)"
-if [[ -z "$SESSION_PATH" ]]; then
-  echo "No session_* directory was created." >&2
-  exit 3
+printf 'Locating Session\n' > "$PIPELINE_RUN_DIR/status/stage.txt"
+if SESSION_PATH="$(python "$PIPELINE_REPO_ROOT/pipeline/session_locator.py" \
+    --toml "$PIPELINE_TOML" --run-dir "$PIPELINE_RUN_DIR" 2>"$PIPELINE_RUN_DIR/logs/session_locator.err")"; then
+    printf '%s\n' "$SESSION_PATH" > "$PIPELINE_RUN_DIR/session_link.txt"
+    printf '%s\n' "$SESSION_PATH" > "$PIPELINE_RUN_DIR/session_path.txt"
+else
+    printf 'FAIL\n' > "$PIPELINE_RUN_DIR/status/tracking.txt"
+    printf 'Tracking Failed\n' > "$PIPELINE_RUN_DIR/status/stage.txt"
+    if [[ "$IDTRACKER_RC" -ne 0 ]]; then
+        exit "$IDTRACKER_RC"
+    fi
+    exit 1
 fi
 
-printf '%s\n' "$SESSION_PATH" > "$PIPELINE_RUN_DIR/session_path.txt"
+# A complete session is authoritative. Preserve the unusual return code as a
+# warning for diagnostics, but allow postprocessing to run.
+if [[ "$IDTRACKER_RC" -ne 0 ]]; then
+    printf 'WARNING: idtrackerai exited %s, but a complete session was validated at %s\n' \
+        "$IDTRACKER_RC" "$SESSION_PATH" \
+        > "$PIPELINE_RUN_DIR/logs/idtracker_exit_warning.txt"
+fi
+
+# The canonical IDtracker session remains where IDtracker created it.
+# Copying or moving sessions is intentionally deferred to a separate maintenance
+# operation so filesystem work can never invalidate tracking or block analysis.
+printf 'DEFERRED\n' > "$PIPELINE_RUN_DIR/status/archive.txt"
+
+printf 'Tracking Complete\n' > "$PIPELINE_RUN_DIR/status/stage.txt"
+printf 'PASS\n' > "$PIPELINE_RUN_DIR/status/tracking.txt"
+exit 0

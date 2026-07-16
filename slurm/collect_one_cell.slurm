@@ -13,7 +13,7 @@ set -euo pipefail
 : "${PIPELINE_METADATA_JSON:?}"
 
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
-conda activate "${POSTPROCESS_CONDA_ENV:-idtrackerai}"
+conda activate "${POSTPROCESS_CONDA_ENV:-beetle_pipeline}"
 
 python "$PIPELINE_REPO_ROOT/collector/collect_outputs.py" \
   --run-dir "$PIPELINE_RUN_DIR" \

@@ -14,7 +14,8 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QPushButton, QLabel, QTabWidget, QTableWidget, QTableWidgetItem,
     QHeaderView, QMessageBox, QFileDialog, QComboBox, QCheckBox, QTextEdit,
-    QAbstractItemView, QProgressBar
+    QAbstractItemView, QProgressBar, QGroupBox, QSpinBox, QDoubleSpinBox,
+    QRadioButton, QButtonGroup
 )
 import tomlkit
 
@@ -530,8 +531,9 @@ class Window(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self.connection_page(), "1. Connection")
         tabs.addTab(self.scan_page(), "2. Scan and Match")
-        tabs.addTab(self.submit_page(), "3. Submit")
-        tabs.addTab(self.diagnostics_page(), "4. Jobs and Diagnostics")
+        tabs.addTab(self.parameters_page(), "3. Parameters")
+        tabs.addTab(self.submit_page(), "4. Submit")
+        tabs.addTab(self.diagnostics_page(), "5. Jobs and Diagnostics")
         self.setCentralWidget(tabs)
 
     def connection_page(self):
@@ -597,6 +599,11 @@ class Window(QMainWindow):
         self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
 
+        selection = QHBoxLayout()
+        for label, action in [("Check All", self.check_all), ("Uncheck All", self.uncheck_all), ("Invert Selection", self.invert_selection)]:
+            b = QPushButton(label); b.clicked.connect(action); selection.addWidget(b)
+        selection.addStretch(); layout.addLayout(selection)
+
         self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels([
             "Use",
@@ -620,12 +627,40 @@ class Window(QMainWindow):
         layout.addWidget(self.table)
         return page
 
+    def _set_checks(self, mode):
+        for i in range(self.table.rowCount()):
+            item=self.table.item(i,0)
+            if item:
+                if mode=='invert': item.setCheckState(Qt.Unchecked if item.checkState()==Qt.Checked else Qt.Checked)
+                else: item.setCheckState(Qt.Checked if mode=='check' else Qt.Unchecked)
+    def check_all(self): self._set_checks('check')
+    def uncheck_all(self): self._set_checks('uncheck')
+    def invert_selection(self): self._set_checks('invert')
+
+    def parameters_page(self):
+        page=QWidget(); layout=QVBoxLayout(page)
+        self.run_full=QRadioButton('Run IDtracker + Postprocess'); self.run_post=QRadioButton('Postprocess Existing Session'); self.run_full.setChecked(True)
+        group=QButtonGroup(page); group.addButton(self.run_full); group.addButton(self.run_post)
+        layout.addWidget(self.run_full); layout.addWidget(self.run_post)
+        archive_note=QLabel('IDtracker sessions remain in their canonical video-folder location. Copying or moving sessions is deferred and never performed during a run.'); archive_note.setWordWrap(True); layout.addWidget(archive_note)
+        self.param={}
+        specs={
+          'Fight':[('analysis_stop_frame','Analysis stop frame',0,0,100000000,1),('contact_px','Contact distance (px)',60,0,10000,.1),('fight_px','Fight distance (px)',35,0,10000,.1),('min_fight_frames','Minimum fight duration (frames)',6,1,100000,1),('roi_wall_buffer_px','Wall buffer (px)',30,0,10000,.1),('window_frames','Window frames',7200,1,100000000,1)],
+          'BA':[('ba_analysis_stop_frame','Analysis stop frame',0,0,100000000,1),('ba_roi_wall_buffer_px','Wall buffer (px)',30,0,10000,.1),('move_threshold_px','Movement threshold (px)',30,0,10000,.1),('movement_onset_consecutive_frames','Movement onset duration (frames)',30,1,100000,1),('turtling_window_frames','Turtle window (frames)',300,1,100000,1),('turtling_min_duration_frames','Turtle minimum duration (frames)',300,1,100000,1)]}
+        tips={'analysis_stop_frame':'0 means use Window frames','ba_analysis_stop_frame':'0 means use all configured frames','contact_px':'Distance defining contact','fight_px':'Stricter fight-distance threshold','roi_wall_buffer_px':'Inward ROI border width','ba_roi_wall_buffer_px':'Inward ROI border width'}
+        for title,rows in specs.items():
+            box=QGroupBox(title); form=QFormLayout(box)
+            for key,label,default,lo,hi,step in rows:
+                w=QSpinBox() if step==1 else QDoubleSpinBox(); w.setRange(lo,hi); w.setValue(default); w.setSingleStep(step); w.setToolTip(tips.get(key,label)); self.param[key]=w; form.addRow(label,w)
+            layout.addWidget(box)
+        layout.addStretch(); return page
+
     def submit_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
         text = QLabel(
             "Each selected row creates a run-specific TOML and metadata file, then "
-            "submits IDtracker → post-processing → collector with afterok dependencies."
+            "submits either IDtracker + post-processing or post-processing only, followed by QC collection."
         )
         text.setWordWrap(True)
         layout.addWidget(text)
@@ -850,6 +885,14 @@ class Window(QMainWindow):
             for c, key in ((5, "area_min"), (6, "area_max"), (7, "background_min"), (8, "status"), (9, "reason")):
                 self.table.setItem(i, c, QTableWidgetItem(str(row[key])))
 
+    def postprocess_args(self, analysis):
+        p=self.param
+        if analysis=='fight':
+            vals={'analysis-stop-frame':p['analysis_stop_frame'].value(),'window-frames':p['window_frames'].value(),'contact-px':p['contact_px'].value(),'fight-px':p['fight_px'].value(),'min-fight-frames':p['min_fight_frames'].value(),'roi-wall-buffer-px':p['roi_wall_buffer_px'].value()}
+        else:
+            vals={'analysis-stop-frame':p['ba_analysis_stop_frame'].value(),'move-threshold-px':p['move_threshold_px'].value(),'movement-onset-consecutive-frames':p['movement_onset_consecutive_frames'].value(),'roi-wall-buffer-px':p['ba_roi_wall_buffer_px'].value(),'turtling-window-frames':p['turtling_window_frames'].value(),'turtling-min-duration-frames':p['turtling_min_duration_frames'].value()}
+        return ' '.join(f'--{k} {v}' for k,v in vals.items())
+
     def submit(self):
         ssh = self.ssh()
         messages = []
@@ -941,6 +984,8 @@ class Window(QMainWindow):
                         "area_max": None if math.isinf(area_max) else area_max,
                         "area_max_is_infinite": math.isinf(area_max),
                         "background_intensity_min": background_min,
+                        "run_mode": "postprocess" if self.run_post.isChecked() else "full",
+                        **{k: w.value() for k,w in self.param.items()},
                     },
                 }
                 ssh.write(metadata_path, json.dumps(metadata, indent=2, allow_nan=False))
@@ -954,10 +999,15 @@ class Window(QMainWindow):
                     "PIPELINE_METADATA_JSON": metadata_path,
                     "PIPELINE_SESSION_OUTPUT_DIR": session_out,
                     "PIPELINE_SESSION": "",
+                    "PIPELINE_RUN_MODE": "postprocess" if self.run_post.isChecked() else "full",
+                    "PIPELINE_ARCHIVE_SESSION": "0",
+                    "PIPELINE_POSTPROCESS_EXTRA_ARGS": self.postprocess_args(analysis),
                 }
-                exports = ",".join(f"{k}={str(v).replace(',', '_')}" for k, v in env.items())
+                exports = " ".join(
+                    f"{k}={shlex.quote(str(v))}" for k, v in env.items()
+                )
                 command = (
-                    f"export {exports.replace(',', ' ')}; "
+                    f"export {exports}; "
                     f"bash {shlex.quote(self.repo_root.text().rstrip('/') + '/scripts/firebird/submit_pipeline_run.sh')}"
                 )
                 result = ssh.run(command)
@@ -980,7 +1030,7 @@ class Window(QMainWindow):
                     "idtracker_job": job_ids["IDTRACKER_JOB"],
                     "postprocess_job": job_ids["POSTPROCESS_JOB"],
                     "collector_job": job_ids["COLLECTOR_JOB"],
-                    "status": "Submitted",
+                    "status": "Postprocess submitted" if self.run_post.isChecked() else "Tracking submitted",
                     "run_dir": run_dir,
                 })
                 self.populate_jobs_table()

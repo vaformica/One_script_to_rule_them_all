@@ -206,3 +206,9 @@ run it can retrieve:
 
 It also provides a guarded button for cancelling post-processing and collector
 jobs that are permanently blocked by failed dependencies.
+
+## v0.8.0 workflow modes
+
+The Parameters tab now provides **Run IDtracker + Postprocess** and **Postprocess Existing Session**. The latter resolves the canonical `session_<name>` beside the source video and never submits a GPU tracking job. Session archives are optional; archive-copy failure is recorded as a warning and does not block postprocessing.
+
+The project-level `QC/` folder contains `run_status.csv`, consolidated BA/fight summary files, renamed track maps, and `QC_Report.html`. Each immutable run contains `session_link.txt`, which always points to the canonical IDtracker session.

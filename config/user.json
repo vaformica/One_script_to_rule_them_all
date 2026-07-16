@@ -1,7 +1,0 @@
-{
-  "ssh_host": "firebird",
-  "identity_file": "~/.ssh/id_ed25519_firebird",
-  "remote_search_root": "/vformic1-swat-lab/2026_Videos/2026_Fights/Testing2/",
-  "remote_project_root": "/data/labs/vformic1-swat-lab/idtracker_pipeline_runs",
-  "remote_repo_root": "/data/labs/vformic1-swat-lab/idtracker_pipeline"
-}
