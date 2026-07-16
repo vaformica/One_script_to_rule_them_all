@@ -1,18 +1,20 @@
 from __future__ import annotations
 import json
 import math
+import sqlite3
+import time
 import shlex
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QObject, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QPushButton, QLabel, QTabWidget, QTableWidget, QTableWidgetItem,
     QHeaderView, QMessageBox, QFileDialog, QComboBox, QCheckBox, QTextEdit,
-    QAbstractItemView
+    QAbstractItemView, QProgressBar
 )
 import tomlkit
 
@@ -71,12 +73,405 @@ def find_values(obj, keys):
     return found
 
 
+
+def _is_number(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _find_first_pair(value):
+    if isinstance(value, list):
+        if len(value) == 2 and all(_is_number(x) for x in value):
+            return value[0], value[1]
+        for item in value:
+            pair = _find_first_pair(item)
+            if pair is not None:
+                return pair
+    return None
+
+
+def _update_threshold_pairs(value, minimum=None, maximum=None):
+    if not isinstance(value, list):
+        return 0
+    if len(value) == 2 and all(_is_number(x) for x in value):
+        if minimum is not None:
+            value[0] = minimum
+        if maximum is not None:
+            value[1] = maximum
+        return 1
+    updated = 0
+    for item in value:
+        updated += _update_threshold_pairs(
+            item,
+            minimum=minimum,
+            maximum=maximum,
+        )
+    return updated
+
+
+def _validate_threshold_array(value, path):
+    if not isinstance(value, list) or not value:
+        raise ValueError(f"{path} must be a non-empty array")
+    numeric = [_is_number(x) for x in value]
+    nested = [isinstance(x, list) for x in value]
+    if any(numeric) and any(nested):
+        raise ValueError(
+            f"{path} mixes scalar values and nested arrays "
+            "(IDtracker requires homogeneous arrays)"
+        )
+    if all(numeric):
+        if len(value) != 2:
+            raise ValueError(f"{path} must be [minimum, maximum]")
+        if value[0] > value[1]:
+            raise ValueError(
+                f"{path} minimum {value[0]} exceeds maximum {value[1]}"
+            )
+        return
+    if all(nested):
+        for index, item in enumerate(value):
+            _validate_threshold_array(item, f"{path}[{index}]")
+        return
+    raise ValueError(f"{path} contains unsupported values")
+
+
+def _validate_thresholds(obj, path="root"):
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            child = f"{path}.{key}"
+            if str(key).lower() in {
+                "area_ths",
+                "area_thresholds",
+                "intensity_ths",
+                "intensity_thresholds",
+            }:
+                _validate_threshold_array(value, child)
+            _validate_thresholds(value, child)
+    elif isinstance(obj, list):
+        for index, value in enumerate(obj):
+            _validate_thresholds(value, f"{path}[{index}]")
+
+
+class LocalIndex:
+    def __init__(self, db_path):
+        self.path = Path(db_path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(str(self.path))
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS indexed_rows (
+                search_root TEXT NOT NULL,
+                toml_path TEXT NOT NULL,
+                row_json TEXT NOT NULL,
+                indexed_at REAL NOT NULL,
+                PRIMARY KEY (search_root, toml_path)
+            )
+        """)
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS summaries (
+                search_root TEXT PRIMARY KEY,
+                video_count INTEGER NOT NULL,
+                toml_count INTEGER NOT NULL,
+                matched_count INTEGER NOT NULL,
+                indexed_at REAL NOT NULL
+            )
+        """)
+        self.conn.commit()
+
+    def replace(self, search_root, rows, video_count, toml_count):
+        now = time.time()
+        with self.conn:
+            self.conn.execute(
+                "DELETE FROM indexed_rows WHERE search_root = ?",
+                (search_root,),
+            )
+            self.conn.executemany(
+                """
+                INSERT INTO indexed_rows
+                (search_root, toml_path, row_json, indexed_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                [
+                    (
+                        search_root,
+                        row["toml"],
+                        json.dumps(row, allow_nan=True),
+                        now,
+                    )
+                    for row in rows
+                ],
+            )
+            self.conn.execute(
+                """
+                INSERT OR REPLACE INTO summaries
+                (search_root, video_count, toml_count, matched_count, indexed_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    search_root,
+                    video_count,
+                    toml_count,
+                    sum(row.get("status") == "Matched" for row in rows),
+                    now,
+                ),
+            )
+
+    def load(self, search_root):
+        rows = [
+            json.loads(row_json)
+            for (row_json,) in self.conn.execute(
+                """
+                SELECT row_json
+                FROM indexed_rows
+                WHERE search_root = ?
+                ORDER BY toml_path
+                """,
+                (search_root,),
+            )
+        ]
+        summary = self.conn.execute(
+            """
+            SELECT video_count, toml_count, matched_count, indexed_at
+            FROM summaries
+            WHERE search_root = ?
+            """,
+            (search_root,),
+        ).fetchone()
+        return rows, summary
+
+    def close(self):
+        self.conn.close()
+
+
+class IndexWorker(QObject):
+    progress = pyqtSignal(str)
+    finished = pyqtSignal(list, int, int, int, float)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, host, key, search_root, db_path, rebuild):
+        super().__init__()
+        self.host = host
+        self.key = key
+        self.search_root = search_root
+        self.db_path = db_path
+        self.rebuild = rebuild
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        index = None
+        try:
+            index = LocalIndex(self.db_path)
+
+            if not self.rebuild:
+                rows, summary = index.load(self.search_root)
+                if summary is None:
+                    raise RuntimeError(
+                        "No saved index exists for this Firebird search root. "
+                        "Use Rebuild Firebird Index first."
+                    )
+                video_count, toml_count, matched_count, indexed_at = summary
+                self.finished.emit(
+                    rows,
+                    int(video_count),
+                    int(toml_count),
+                    int(matched_count),
+                    float(indexed_at),
+                )
+                return
+
+            ssh = SSH(self.host, self.key)
+            self.progress.emit("Recursively listing videos and TOMLs on Firebird...")
+
+            find_command = (
+                f"find {shlex.quote(self.search_root)} "
+                r"-type d \( -name '.git' -o -name '__pycache__' "
+                r"-o -name 'node_modules' -o -name 'logs' "
+                r"-o -name 'outputs' -o -name 'results' "
+                r"-o -name 'archive' -o -name 'archives' "
+                r"-o -name 'session_*' -o -name 'run_*' \) -prune "
+                r"-o -type f \( -iname '*.mp4' -o -iname '*.avi' "
+                r"-o -iname '*.toml' \) -print"
+            )
+            output = ssh.run(find_command, timeout=3600)
+            if self._cancelled:
+                self.cancelled.emit()
+                return
+
+            all_paths = [line.strip() for line in output.splitlines() if line.strip()]
+            video_paths = [
+                p for p in all_paths
+                if Path(p).suffix.lower() in {".mp4", ".avi"}
+            ]
+            toml_paths = [
+                p for p in all_paths
+                if Path(p).suffix.lower() == ".toml"
+            ]
+            videos_by_name = {}
+            for video_path in video_paths:
+                videos_by_name.setdefault(
+                    Path(video_path).name.lower(),
+                    [],
+                ).append(video_path)
+
+            rows = []
+            total = len(toml_paths)
+
+            for number, toml_path in enumerate(toml_paths, start=1):
+                if self._cancelled:
+                    self.cancelled.emit()
+                    return
+
+                if number == 1 or number % 10 == 0 or number == total:
+                    self.progress.emit(
+                        f"Reading TOMLs: {number:,} of {total:,}"
+                    )
+
+                try:
+                    source = ssh.read(toml_path)
+                    doc = tomlkit.parse(source)
+
+                    embedded_name = None
+                    for value in find_values(
+                        doc,
+                        {
+                            "video_path",
+                            "video_paths",
+                            "video",
+                            "videos",
+                            "video_file",
+                        },
+                    ):
+                        candidates = (
+                            [value]
+                            if isinstance(value, str)
+                            else value
+                            if isinstance(value, list)
+                            else []
+                        )
+                        for candidate in candidates:
+                            if (
+                                isinstance(candidate, str)
+                                and candidate.lower().endswith((".mp4", ".avi"))
+                            ):
+                                embedded_name = Path(candidate).name
+                                break
+                        if embedded_name:
+                            break
+
+                    matches = videos_by_name.get(
+                        (embedded_name or "").lower(),
+                        [],
+                    )
+                    video = matches[0] if len(matches) == 1 else ""
+
+                    area_pair = None
+                    for value in find_values(
+                        doc,
+                        {"area_ths", "area_thresholds"},
+                    ):
+                        area_pair = _find_first_pair(value)
+                        if area_pair is not None:
+                            break
+
+                    intensity_pair = None
+                    for value in find_values(
+                        doc,
+                        {"intensity_ths", "intensity_thresholds"},
+                    ):
+                        intensity_pair = _find_first_pair(value)
+                        if intensity_pair is not None:
+                            break
+
+                    animals = next(
+                        iter(
+                            find_values(
+                                doc,
+                                {"number_of_animals", "n_animals"},
+                            )
+                        ),
+                        None,
+                    )
+
+                    status = "Matched" if video else "Unmatched"
+                    reason = (
+                        "Exact embedded video filename"
+                        if video
+                        else "No unique exact embedded video match"
+                    )
+                    if len(matches) > 1:
+                        reason = "Multiple videos share the embedded filename"
+
+                    area_pair = area_pair or (None, None)
+                    intensity_pair = intensity_pair or (None, None)
+                    stem = Path(toml_path).stem
+                    cell = stem.rsplit("_", 1)[-1]
+
+                    rows.append({
+                        "use": bool(video),
+                        "video": video,
+                        "cell": cell,
+                        "toml": toml_path,
+                        "analysis": (
+                            "ba"
+                            if animals == 1
+                            else "fight"
+                            if animals == 2
+                            else "ba"
+                        ),
+                        "area_min": area_pair[0],
+                        "area_max": area_pair[1],
+                        "background_min": intensity_pair[0],
+                        "status": status,
+                        "reason": reason,
+                    })
+                except Exception as exc:
+                    rows.append({
+                        "use": False,
+                        "video": "",
+                        "cell": "",
+                        "toml": toml_path,
+                        "analysis": "ba",
+                        "area_min": None,
+                        "area_max": None,
+                        "background_min": None,
+                        "status": "TOML error",
+                        "reason": str(exc),
+                    })
+
+            index.replace(
+                self.search_root,
+                rows,
+                len(video_paths),
+                len(toml_paths),
+            )
+            indexed_at = time.time()
+            self.finished.emit(
+                rows,
+                len(video_paths),
+                len(toml_paths),
+                sum(row["status"] == "Matched" for row in rows),
+                indexed_at,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if index is not None:
+                index.close()
+
+
+
 class Window(QMainWindow):
     def __init__(self):
         super().__init__()
         self.cfg = load_config()
         self.rows = []
         self.jobs = []
+        self.index_thread = None
+        self.index_worker = None
+        self.index_db_path = str(
+            Path.home() / '.beetle_idtracker' / 'firebird_index.sqlite3'
+        )
         self.setWindowTitle("Beetle IDtracker Unified Pipeline")
         self.resize(1500, 850)
         tabs = QTabWidget()
@@ -112,18 +507,63 @@ class Window(QMainWindow):
     def scan_page(self):
         page = QWidget()
         layout = QVBoxLayout(page)
-        button = QPushButton("Recursively Find Videos and TOMLs")
-        button.clicked.connect(self.scan)
-        layout.addWidget(button)
-        self.summary = QLabel("No scan yet.")
+
+        note = QLabel(
+            "Rebuild Firebird Index performs the remote recursive scan and "
+            "stores parsed matches in a local SQLite index on this Mac. "
+            "Search Existing Index reuses that local index without rescanning."
+        )
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+        controls = QHBoxLayout()
+
+        self.search_index_button = QPushButton("Search Existing Index")
+        self.search_index_button.clicked.connect(self.search_existing_index)
+        controls.addWidget(self.search_index_button)
+
+        self.rebuild_index_button = QPushButton("Rebuild Firebird Index")
+        self.rebuild_index_button.clicked.connect(self.scan)
+        controls.addWidget(self.rebuild_index_button)
+
+        self.cancel_index_button = QPushButton("Cancel")
+        self.cancel_index_button.setEnabled(False)
+        self.cancel_index_button.clicked.connect(self.cancel_scan)
+        controls.addWidget(self.cancel_index_button)
+
+        layout.addLayout(controls)
+
+        self.index_progress = QProgressBar()
+        self.index_progress.setRange(0, 0)
+        self.index_progress.setVisible(False)
+        layout.addWidget(self.index_progress)
+
+        self.summary = QLabel(
+            "No index loaded. Rebuild the Firebird index the first time."
+        )
+        self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
+
         self.table = QTableWidget(0, 10)
         self.table.setHorizontalHeaderLabels([
-            "Use", "Video", "Cell", "TOML", "Analysis", "Blob min",
-            "Blob max", "Background", "Status", "Reason"
+            "Use",
+            "Video",
+            "Cell",
+            "TOML",
+            "Analysis",
+            "Blob min",
+            "Blob max",
+            "Background threshold min",
+            "Status",
+            "Reason",
         ])
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(9, QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeToContents
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            9,
+            QHeaderView.Stretch,
+        )
         layout.addWidget(self.table)
         return page
 
@@ -146,67 +586,67 @@ class Window(QMainWindow):
         return page
 
 
-def diagnostics_page(self):
-    page = QWidget()
-    layout = QVBoxLayout(page)
+    def diagnostics_page(self):
+        page = QWidget()
+        layout = QVBoxLayout(page)
 
-    explanation = QLabel(
-        "Select a submitted run, then retrieve SLURM state, accounting "
-        "history, dependencies, exit codes, run metadata, session discovery, "
-        "and the most recent stdout/stderr logs directly from Firebird."
-    )
-    explanation.setWordWrap(True)
-    layout.addWidget(explanation)
+        explanation = QLabel(
+            "Select a submitted run, then retrieve SLURM state, accounting "
+            "history, dependencies, exit codes, run metadata, session discovery, "
+            "and the most recent stdout/stderr logs directly from Firebird."
+        )
+        explanation.setWordWrap(True)
+        layout.addWidget(explanation)
 
-    self.jobs_table = QTableWidget(0, 8)
-    self.jobs_table.setHorizontalHeaderLabels([
-        "Run", "Date/time", "Video/cell", "IDtracker job",
-        "Post-process job", "Collector job", "Status", "Remote run folder"
-    ])
-    self.jobs_table.setSelectionBehavior(QAbstractItemView.SelectRows)
-    self.jobs_table.setAlternatingRowColors(True)
-    self.jobs_table.horizontalHeader().setSectionResizeMode(
-        QHeaderView.ResizeToContents
-    )
-    self.jobs_table.horizontalHeader().setSectionResizeMode(
-        7, QHeaderView.Stretch
-    )
-    self.jobs_table.itemSelectionChanged.connect(
-        self.retrieve_selected_diagnostics
-    )
-    layout.addWidget(self.jobs_table)
+        self.jobs_table = QTableWidget(0, 8)
+        self.jobs_table.setHorizontalHeaderLabels([
+            "Run", "Date/time", "Video/cell", "IDtracker job",
+            "Post-process job", "Collector job", "Status", "Remote run folder"
+        ])
+        self.jobs_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.jobs_table.setAlternatingRowColors(True)
+        self.jobs_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeToContents
+        )
+        self.jobs_table.horizontalHeader().setSectionResizeMode(
+            7, QHeaderView.Stretch
+        )
+        self.jobs_table.itemSelectionChanged.connect(
+            self.retrieve_selected_diagnostics
+        )
+        layout.addWidget(self.jobs_table)
 
-    buttons = QHBoxLayout()
+        buttons = QHBoxLayout()
 
-    refresh_all = QPushButton("Refresh All Job States")
-    refresh_all.clicked.connect(self.refresh_all_job_states)
-    buttons.addWidget(refresh_all)
+        refresh_all = QPushButton("Refresh All Job States")
+        refresh_all.clicked.connect(self.refresh_all_job_states)
+        buttons.addWidget(refresh_all)
 
-    diagnose = QPushButton("Diagnose Selected Run")
-    diagnose.clicked.connect(self.retrieve_selected_diagnostics)
-    buttons.addWidget(diagnose)
+        diagnose = QPushButton("Diagnose Selected Run")
+        diagnose.clicked.connect(self.retrieve_selected_diagnostics)
+        buttons.addWidget(diagnose)
 
-    logs = QPushButton("Fetch Selected Run Logs")
-    logs.clicked.connect(self.fetch_selected_logs)
-    buttons.addWidget(logs)
+        logs = QPushButton("Fetch Selected Run Logs")
+        logs.clicked.connect(self.fetch_selected_logs)
+        buttons.addWidget(logs)
 
-    sessions = QPushButton("Check Session Discovery")
-    sessions.clicked.connect(self.check_selected_session)
-    buttons.addWidget(sessions)
+        sessions = QPushButton("Check Session Discovery")
+        sessions.clicked.connect(self.check_selected_session)
+        buttons.addWidget(sessions)
 
-    cancel_blocked = QPushButton("Cancel Blocked Dependents")
-    cancel_blocked.clicked.connect(self.cancel_selected_blocked_jobs)
-    buttons.addWidget(cancel_blocked)
+        cancel_blocked = QPushButton("Cancel Blocked Dependents")
+        cancel_blocked.clicked.connect(self.cancel_selected_blocked_jobs)
+        buttons.addWidget(cancel_blocked)
 
-    layout.addLayout(buttons)
+        layout.addLayout(buttons)
 
-    self.diagnostics_output = QTextEdit()
-    self.diagnostics_output.setReadOnly(True)
-    self.diagnostics_output.setPlaceholderText(
-        "Diagnostics for the selected run will appear here."
-    )
-    layout.addWidget(self.diagnostics_output, 1)
-    return page
+        self.diagnostics_output = QTextEdit()
+        self.diagnostics_output.setReadOnly(True)
+        self.diagnostics_output.setPlaceholderText(
+            "Diagnostics for the selected run will appear here."
+        )
+        layout.addWidget(self.diagnostics_output, 1)
+        return page
 
     def ssh(self):
         return SSH(self.host.text().strip(), self.key.text().strip())
@@ -234,60 +674,112 @@ def diagnostics_page(self):
             QMessageBox.critical(self, "Connection failed", str(exc))
 
     def scan(self):
-        try:
-            root = self.search_root.text().strip()
-            output = self.ssh().run(
-                f"find {shlex.quote(root)} -type f "
-                r"\( -iname '*.mp4' -o -iname '*.avi' -o -iname '*.toml' \) -print"
+        self.start_index_operation(rebuild=True)
+
+    def search_existing_index(self):
+        self.start_index_operation(rebuild=False)
+
+    def start_index_operation(self, rebuild):
+        if self.index_thread is not None:
+            QMessageBox.information(
+                self,
+                "Index operation running",
+                "Please wait for the current index operation to finish.",
             )
-            paths = [x for x in output.splitlines() if x.strip()]
-            videos = {Path(p).name.lower(): p for p in paths if Path(p).suffix.lower() in (".mp4", ".avi")}
-            tomls = [p for p in paths if Path(p).suffix.lower() == ".toml"]
-            rows = []
-            for toml_path in tomls:
-                name = Path(toml_path).name
-                stem = Path(toml_path).stem
-                try:
-                    text = self.ssh().read(toml_path)
-                    doc = tomlkit.parse(text)
-                    embedded = None
-                    for value in find_values(doc, {
-                        "video_path", "video_paths", "video", "videos", "video_file"
-                    }):
-                        candidates = [value] if isinstance(value, str) else value if isinstance(value, list) else []
-                        for candidate in candidates:
-                            if isinstance(candidate, str) and candidate.lower().endswith((".mp4", ".avi")):
-                                embedded = Path(candidate).name
-                                break
-                        if embedded:
-                            break
-                    video = videos.get((embedded or "").lower())
-                    cell = stem.rsplit("_", 1)[-1]
-                    area = next((x for x in find_values(doc, {"area_ths", "area_thresholds"}) if isinstance(x, list) and len(x) >= 2), [None, None])
-                    intensity = next((x for x in find_values(doc, {"intensity_ths", "intensity_thresholds"}) if isinstance(x, list) and len(x) >= 2), [None, None])
-                    animals = next(iter(find_values(doc, {"number_of_animals", "n_animals"})), None)
-                    analysis = "ba" if animals == 1 else "fight" if animals == 2 else "ba"
-                    rows.append({
-                        "use": bool(video), "video": video or "", "cell": cell,
-                        "toml": toml_path, "analysis": analysis,
-                        "area_min": area[0], "area_max": area[1],
-                        "background": intensity[1], "status": "Matched" if video else "Unmatched",
-                        "reason": "Embedded video filename" if video else "No exact embedded video match",
-                    })
-                except Exception as exc:
-                    rows.append({
-                        "use": False, "video": "", "cell": "", "toml": toml_path,
-                        "analysis": "ba", "area_min": None, "area_max": None,
-                        "background": None, "status": "TOML error", "reason": str(exc)
-                    })
-            self.rows = rows
-            self.populate()
-            self.summary.setText(
-                f"Found {len(videos)} videos and {len(tomls)} TOMLs; "
-                f"{sum(r['status']=='Matched' for r in rows)} exact matches."
+            return
+
+        search_root = self.search_root.text().strip()
+        if not search_root:
+            QMessageBox.warning(
+                self,
+                "Missing search root",
+                "Enter the recursive Firebird search root on the Connection tab.",
             )
-        except Exception as exc:
-            QMessageBox.critical(self, "Scan failed", str(exc))
+            return
+
+        self.search_index_button.setEnabled(False)
+        self.rebuild_index_button.setEnabled(False)
+        self.cancel_index_button.setEnabled(True)
+        self.index_progress.setVisible(True)
+        self.summary.setText(
+            "Rebuilding Firebird index..."
+            if rebuild
+            else "Loading existing Mac index..."
+        )
+
+        self.index_thread = QThread(self)
+        self.index_worker = IndexWorker(
+            self.host.text().strip(),
+            self.key.text().strip(),
+            search_root,
+            self.index_db_path,
+            rebuild,
+        )
+        self.index_worker.moveToThread(self.index_thread)
+
+        self.index_thread.started.connect(self.index_worker.run)
+        self.index_worker.progress.connect(self.on_index_progress)
+        self.index_worker.finished.connect(self.on_index_finished)
+        self.index_worker.failed.connect(self.on_index_failed)
+        self.index_worker.cancelled.connect(self.on_index_cancelled)
+
+        self.index_worker.finished.connect(self.index_thread.quit)
+        self.index_worker.failed.connect(self.index_thread.quit)
+        self.index_worker.cancelled.connect(self.index_thread.quit)
+        self.index_thread.finished.connect(self.cleanup_index_thread)
+
+        self.index_thread.start()
+
+    def cancel_scan(self):
+        if self.index_worker is not None:
+            self.summary.setText("Cancelling index operation...")
+            self.cancel_index_button.setEnabled(False)
+            self.index_worker.cancel()
+
+    def on_index_progress(self, message):
+        self.summary.setText(message)
+
+    def on_index_finished(
+        self,
+        rows,
+        video_count,
+        toml_count,
+        matched_count,
+        indexed_at,
+    ):
+        self.rows = rows
+        self.populate()
+        timestamp = datetime.fromtimestamp(indexed_at).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        self.summary.setText(
+            f"Index dated {timestamp}: {video_count:,} videos, "
+            f"{toml_count:,} TOMLs, {matched_count:,} exact matches."
+        )
+        self.finish_index_ui()
+
+    def on_index_failed(self, message):
+        self.summary.setText("Index operation failed.")
+        self.finish_index_ui()
+        QMessageBox.critical(self, "Index operation failed", message)
+
+    def on_index_cancelled(self):
+        self.summary.setText("Index operation cancelled.")
+        self.finish_index_ui()
+
+    def finish_index_ui(self):
+        self.search_index_button.setEnabled(True)
+        self.rebuild_index_button.setEnabled(True)
+        self.cancel_index_button.setEnabled(False)
+        self.index_progress.setVisible(False)
+
+    def cleanup_index_thread(self):
+        if self.index_worker is not None:
+            self.index_worker.deleteLater()
+        if self.index_thread is not None:
+            self.index_thread.deleteLater()
+        self.index_worker = None
+        self.index_thread = None
 
     def populate(self):
         self.table.setRowCount(len(self.rows))
@@ -302,7 +794,7 @@ def diagnostics_page(self):
             combo.addItems(["ba", "fight"])
             combo.setCurrentText(row["analysis"])
             self.table.setCellWidget(i, 4, combo)
-            for c, key in ((5, "area_min"), (6, "area_max"), (7, "background"), (8, "status"), (9, "reason")):
+            for c, key in ((5, "area_min"), (6, "area_max"), (7, "background_min"), (8, "status"), (9, "reason")):
                 self.table.setItem(i, c, QTableWidgetItem(str(row[key])))
 
     def submit(self):
@@ -315,7 +807,7 @@ def diagnostics_page(self):
                 analysis = self.table.cellWidget(i, 4).currentText()
                 area_min = float(self.table.item(i, 5).text())
                 area_max = float(self.table.item(i, 6).text())
-                background = float(self.table.item(i, 7).text())
+                background_min = float(self.table.item(i, 7).text())
                 now = datetime.now()
                 stamp = now.strftime("%Y%m%d_%H%M%S")
                 run_index = int(ssh.run(
@@ -335,19 +827,51 @@ def diagnostics_page(self):
                 ssh.run(f"mkdir -p {shlex.quote(input_dir)} {shlex.quote(session_out)}")
                 source = ssh.read(row["toml"])
                 doc = tomlkit.parse(source)
-                def edit(obj):
+                updates = {"area": 0, "intensity": 0}
+
+                def edit_thresholds(obj):
                     if isinstance(obj, dict):
-                        for k, v in obj.items():
-                            if str(k).lower() in {"area_ths", "area_thresholds"} and isinstance(v, list) and len(v)>=2:
-                                v[0], v[1] = area_min, area_max
-                            elif str(k).lower() in {"intensity_ths", "intensity_thresholds"} and isinstance(v, list) and len(v)>=2:
-                                v[1] = background
-                            edit(v)
+                        for key, value in obj.items():
+                            key_lower = str(key).lower()
+                            if key_lower in {"area_ths", "area_thresholds"}:
+                                updates["area"] += _update_threshold_pairs(
+                                    value,
+                                    minimum=area_min,
+                                    maximum=area_max,
+                                )
+                            elif key_lower in {
+                                "intensity_ths",
+                                "intensity_thresholds",
+                            }:
+                                # GUI edits the MINIMUM background intensity
+                                # threshold. The maximum is preserved.
+                                updates["intensity"] += _update_threshold_pairs(
+                                    value,
+                                    minimum=background_min,
+                                    maximum=None,
+                                )
+                            edit_thresholds(value)
                     elif isinstance(obj, list):
-                        for v in obj: edit(v)
-                edit(doc)
+                        for value in obj:
+                            edit_thresholds(value)
+
+                edit_thresholds(doc)
+
+                if updates["area"] == 0:
+                    raise ValueError(
+                        "No blob-area threshold pair was found in the TOML."
+                    )
+                if updates["intensity"] == 0:
+                    raise ValueError(
+                        "No intensity threshold pair was found in the TOML."
+                    )
+
+                _validate_thresholds(doc)
                 copied_toml = input_dir + "/" + Path(row["toml"]).name
-                ssh.write(copied_toml, tomlkit.dumps(doc))
+                rendered_toml = tomlkit.dumps(doc)
+                reparsed = tomlkit.parse(rendered_toml)
+                _validate_thresholds(reparsed)
+                ssh.write(copied_toml, rendered_toml)
                 metadata = {
                     "run_index": run_index,
                     "run_timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
@@ -363,7 +887,7 @@ def diagnostics_page(self):
                         "area_min": area_min,
                         "area_max": None if math.isinf(area_max) else area_max,
                         "area_max_is_infinite": math.isinf(area_max),
-                        "background_difference": background,
+                        "background_intensity_min": background_min,
                     },
                 }
                 ssh.write(metadata_path, json.dumps(metadata, indent=2, allow_nan=False))
@@ -414,224 +938,270 @@ def diagnostics_page(self):
 
 
 
-def populate_jobs_table(self):
-    if not hasattr(self, "jobs_table"):
-        return
-    self.jobs_table.setRowCount(len(self.jobs))
-    for row_number, job in enumerate(self.jobs):
-        values = [
-            f"{int(job['run_index']):05d}",
-            job["timestamp"],
-            job["label"],
-            job.get("idtracker_job", ""),
-            job.get("postprocess_job", ""),
-            job.get("collector_job", ""),
-            job.get("status", "Submitted"),
-            job["run_dir"],
-        ]
-        for column, value in enumerate(values):
-            item = QTableWidgetItem(str(value))
-            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-            self.jobs_table.setItem(row_number, column, item)
+    def populate_jobs_table(self):
+        if not hasattr(self, "jobs_table"):
+            return
+        self.jobs_table.setRowCount(len(self.jobs))
+        for row_number, job in enumerate(self.jobs):
+            values = [
+                f"{int(job['run_index']):05d}",
+                job["timestamp"],
+                job["label"],
+                job.get("idtracker_job", ""),
+                job.get("postprocess_job", ""),
+                job.get("collector_job", ""),
+                job.get("status", "Submitted"),
+                job["run_dir"],
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                self.jobs_table.setItem(row_number, column, item)
 
-def selected_job(self):
-    if not hasattr(self, "jobs_table"):
-        return None
-    rows = self.jobs_table.selectionModel().selectedRows()
-    if not rows:
-        return None
-    index = rows[0].row()
-    if not 0 <= index < len(self.jobs):
-        return None
-    return self.jobs[index]
+    def selected_job(self):
+        if not hasattr(self, "jobs_table"):
+            return None
+        rows = self.jobs_table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        index = rows[0].row()
+        if not 0 <= index < len(self.jobs):
+            return None
+        return self.jobs[index]
 
-def retrieve_selected_diagnostics(self):
-    job = self.selected_job()
-    if job is None:
-        return
-    try:
-        script = (
-            self.repo_root.text().rstrip("/")
-            + "/scripts/firebird/diagnose_pipeline_run.sh"
-        )
-        command = (
-            f"bash {shlex.quote(script)} "
-            f"{shlex.quote(job['run_dir'])}"
-        )
-        output = self.ssh().run(command, timeout=300)
-        self.diagnostics_output.setPlainText(output)
-    except Exception as exc:
-        self.diagnostics_output.setPlainText(
-            f"Could not retrieve diagnostics:\n{exc}"
-        )
-
-def fetch_selected_logs(self):
-    job = self.selected_job()
-    if job is None:
-        QMessageBox.warning(
-            self, "Select a run", "Select a run in the table first."
-        )
-        return
-    try:
-        run_dir = job["run_dir"]
-        command = (
-            f"if [[ -d {shlex.quote(run_dir + '/logs')} ]]; then "
-            f"for f in {shlex.quote(run_dir + '/logs')}/*.out "
-            f"{shlex.quote(run_dir + '/logs')}/*.err; do "
-            f"[[ -f \"$f\" ]] || continue; "
-            f"echo; echo \"===== $f =====\"; tail -n 300 \"$f\"; done; "
-            "else echo 'No logs directory exists.'; fi"
-        )
-        self.diagnostics_output.setPlainText(
-            self.ssh().run(command, timeout=300)
-        )
-    except Exception as exc:
-        QMessageBox.critical(self, "Log retrieval failed", str(exc))
-
-def check_selected_session(self):
-    job = self.selected_job()
-    if job is None:
-        QMessageBox.warning(
-            self, "Select a run", "Select a run in the table first."
-        )
-        return
-    try:
-        run_dir = job["run_dir"]
-        command = (
-            f"echo 'Run: {shlex.quote(run_dir)}'; "
-            f"if [[ -f {shlex.quote(run_dir + '/session_path.txt')} ]]; then "
-            f"echo 'Recorded session:'; "
-            f"cat {shlex.quote(run_dir + '/session_path.txt')}; "
-            f"session=$(cat {shlex.quote(run_dir + '/session_path.txt')}); "
-            f"echo; echo 'Session files:'; "
-            f"find \"$session\" -maxdepth 4 -type f "
-            r"\( -name 'trajectories*.npy' -o -name 'trajectories*.h5' "
-            r"-o -name 'session.json' -o -name 'attributes.json' \) "
-            r"-printf '%TY-%Tm-%Td %TH:%TM:%TS\t%p\n' 2>/dev/null | sort; "
-            f"else echo 'session_path.txt is missing'; fi; "
-            f"echo; echo 'All session_* directories under run:'; "
-            f"find {shlex.quote(run_dir)} -type d -name 'session_*' "
-            r"-printf '%TY-%Tm-%Td %TH:%TM:%TS\t%p\n' 2>/dev/null "
-            "| sort -r | head -30"
-        )
-        self.diagnostics_output.setPlainText(
-            self.ssh().run(command, timeout=300)
-        )
-    except Exception as exc:
-        QMessageBox.critical(
-            self, "Session check failed", str(exc)
-        )
-
-def refresh_all_job_states(self):
-    if not self.jobs:
-        QMessageBox.information(
-            self, "No jobs", "No runs have been submitted in this session."
-        )
-        return
-
-    for job in self.jobs:
-        ids = [
-            job.get("idtracker_job", ""),
-            job.get("postprocess_job", ""),
-            job.get("collector_job", ""),
-        ]
-        ids = [job_id for job_id in ids if job_id]
-        if not ids:
-            job["status"] = "No jobs"
-            continue
-
-        joined = ",".join(ids)
-        command = (
-            f"squeue -h -j {shlex.quote(joined)} -o '%i|%T|%R'; "
-            f"sacct -n -X -P -j {shlex.quote(joined)} "
-            "--format=JobIDRaw,State,ExitCode,Elapsed"
-        )
+    def retrieve_selected_diagnostics(self):
+        job = self.selected_job()
+        if job is None:
+            return
         try:
-            output = self.ssh().run(command)
-            states = []
-            for line in output.splitlines():
-                if "|" not in line:
-                    continue
-                fields = line.split("|")
-                if len(fields) >= 2 and fields[0] in ids:
-                    states.append(
-                        f"{fields[0]}:{fields[1]}"
-                    )
-            job["status"] = ", ".join(dict.fromkeys(states)) or "Unknown"
+            script = (
+                self.repo_root.text().rstrip("/")
+                + "/scripts/firebird/diagnose_pipeline_run.sh"
+            )
+            command = (
+                f"bash {shlex.quote(script)} "
+                f"{shlex.quote(job['run_dir'])}"
+            )
+            output = self.ssh().run(command, timeout=300)
+            self.diagnostics_output.setPlainText(output)
         except Exception as exc:
-            job["status"] = f"Error: {exc}"
+            self.diagnostics_output.setPlainText(
+                f"Could not retrieve diagnostics:\n{exc}"
+            )
 
-    self.populate_jobs_table()
+    def fetch_selected_logs(self):
+        job = self.selected_job()
+        if job is None:
+            QMessageBox.warning(
+                self, "Select a run", "Select a run in the table first."
+            )
+            return
+        try:
+            run_dir = job["run_dir"]
+            command = (
+                f"if [[ -d {shlex.quote(run_dir + '/logs')} ]]; then "
+                f"for f in {shlex.quote(run_dir + '/logs')}/*.out "
+                f"{shlex.quote(run_dir + '/logs')}/*.err; do "
+                f"[[ -f \"$f\" ]] || continue; "
+                f"echo; echo \"===== $f =====\"; tail -n 300 \"$f\"; done; "
+                "else echo 'No logs directory exists.'; fi"
+            )
+            self.diagnostics_output.setPlainText(
+                self.ssh().run(command, timeout=300)
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Log retrieval failed", str(exc))
 
-def cancel_selected_blocked_jobs(self):
-    job = self.selected_job()
-    if job is None:
-        QMessageBox.warning(
-            self, "Select a run", "Select a run in the table first."
-        )
-        return
+    def check_selected_session(self):
+        job = self.selected_job()
+        if job is None:
+            QMessageBox.warning(
+                self, "Select a run", "Select a run in the table first."
+            )
+            return
+        try:
+            run_dir = job["run_dir"]
+            command = (
+                f"echo 'Run: {shlex.quote(run_dir)}'; "
+                f"if [[ -f {shlex.quote(run_dir + '/session_path.txt')} ]]; then "
+                f"echo 'Recorded session:'; "
+                f"cat {shlex.quote(run_dir + '/session_path.txt')}; "
+                f"session=$(cat {shlex.quote(run_dir + '/session_path.txt')}); "
+                f"echo; echo 'Session files:'; "
+                f"find \"$session\" -maxdepth 4 -type f "
+                r"\( -name 'trajectories*.npy' -o -name 'trajectories*.h5' "
+                r"-o -name 'session.json' -o -name 'attributes.json' \) "
+                r"-printf '%TY-%Tm-%Td %TH:%TM:%TS\t%p\n' 2>/dev/null | sort; "
+                f"else echo 'session_path.txt is missing'; fi; "
+                f"echo; echo 'All session_* directories under run:'; "
+                f"find {shlex.quote(run_dir)} -type d -name 'session_*' "
+                r"-printf '%TY-%Tm-%Td %TH:%TM:%TS\t%p\n' 2>/dev/null "
+                "| sort -r | head -30"
+            )
+            self.diagnostics_output.setPlainText(
+                self.ssh().run(command, timeout=300)
+            )
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Session check failed", str(exc)
+            )
 
-    candidates = [
-        job.get("postprocess_job", ""),
-        job.get("collector_job", ""),
-    ]
-    candidates = [job_id for job_id in candidates if job_id]
-    if not candidates:
-        QMessageBox.information(
-            self, "No dependent jobs", "No dependent job IDs are recorded."
-        )
-        return
-
-    joined = " ".join(shlex.quote(job_id) for job_id in candidates)
-    try:
-        states = self.ssh().run(
-            f"squeue -h -j {shlex.quote(','.join(candidates))} "
-            "-o '%i|%T|%R'"
-        )
-        blocked = []
-        for line in states.splitlines():
-            fields = line.split("|", 2)
-            if len(fields) != 3:
-                continue
-            job_id, state, reason = fields
-            if state == "PENDING" and (
-                "Dependency" in reason
-                or "DependencyNeverSatisfied" in reason
-            ):
-                blocked.append(job_id)
-
-        if not blocked:
+    def refresh_all_job_states(self):
+        if not self.jobs:
             QMessageBox.information(
-                self,
-                "No blocked jobs",
-                "No pending dependency-blocked jobs were found.",
+                self, "No jobs", "No runs have been submitted in this session."
             )
             return
 
-        answer = QMessageBox.question(
-            self,
-            "Cancel blocked jobs",
-            "Cancel these blocked dependent jobs?\n\n"
-            + "\n".join(blocked),
-        )
-        if answer == QMessageBox.Yes:
-            self.ssh().run(
-                "scancel "
-                + " ".join(shlex.quote(x) for x in blocked)
+        for job in self.jobs:
+            ids = [
+                job.get("idtracker_job", ""),
+                job.get("postprocess_job", ""),
+                job.get("collector_job", ""),
+            ]
+            ids = [job_id for job_id in ids if job_id]
+            if not ids:
+                job["status"] = "No jobs"
+                continue
+
+            joined = ",".join(ids)
+            command = (
+                f"squeue -h -j {shlex.quote(joined)} -o '%i|%T|%R'; "
+                f"sacct -n -X -P -j {shlex.quote(joined)} "
+                "--format=JobIDRaw,State,ExitCode,Elapsed"
             )
+            try:
+                output = self.ssh().run(command)
+                states = []
+                for line in output.splitlines():
+                    if "|" not in line:
+                        continue
+                    fields = line.split("|")
+                    if len(fields) >= 2 and fields[0] in ids:
+                        states.append(
+                            f"{fields[0]}:{fields[1]}"
+                        )
+                job["status"] = ", ".join(dict.fromkeys(states)) or "Unknown"
+            except Exception as exc:
+                job["status"] = f"Error: {exc}"
+
+        self.populate_jobs_table()
+
+    def cancel_selected_blocked_jobs(self):
+        job = self.selected_job()
+        if job is None:
+            QMessageBox.warning(
+                self, "Select a run", "Select a run in the table first."
+            )
+            return
+
+        candidates = [
+            job.get("postprocess_job", ""),
+            job.get("collector_job", ""),
+        ]
+        candidates = [job_id for job_id in candidates if job_id]
+        if not candidates:
             QMessageBox.information(
-                self,
-                "Cancelled",
-                "Cancelled: " + ", ".join(blocked),
+                self, "No dependent jobs", "No dependent job IDs are recorded."
             )
-            self.refresh_all_job_states()
-    except Exception as exc:
-        QMessageBox.critical(
-            self, "Cancellation failed", str(exc)
+            return
+
+        joined = " ".join(shlex.quote(job_id) for job_id in candidates)
+        try:
+            states = self.ssh().run(
+                f"squeue -h -j {shlex.quote(','.join(candidates))} "
+                "-o '%i|%T|%R'"
+            )
+            blocked = []
+            for line in states.splitlines():
+                fields = line.split("|", 2)
+                if len(fields) != 3:
+                    continue
+                job_id, state, reason = fields
+                if state == "PENDING" and (
+                    "Dependency" in reason
+                    or "DependencyNeverSatisfied" in reason
+                ):
+                    blocked.append(job_id)
+
+            if not blocked:
+                QMessageBox.information(
+                    self,
+                    "No blocked jobs",
+                    "No pending dependency-blocked jobs were found.",
+                )
+                return
+
+            answer = QMessageBox.question(
+                self,
+                "Cancel blocked jobs",
+                "Cancel these blocked dependent jobs?\n\n"
+                + "\n".join(blocked),
+            )
+            if answer == QMessageBox.Yes:
+                self.ssh().run(
+                    "scancel "
+                    + " ".join(shlex.quote(x) for x in blocked)
+                )
+                QMessageBox.information(
+                    self,
+                    "Cancelled",
+                    "Cancelled: " + ", ".join(blocked),
+                )
+                self.refresh_all_job_states()
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Cancellation failed", str(exc)
+            )
+
+
+
+
+    def closeEvent(self, event):
+        if self.index_worker is not None:
+            self.index_worker.cancel()
+        if self.index_thread is not None:
+            self.index_thread.quit()
+            self.index_thread.wait(3000)
+        event.accept()
+
+
+def validate_window_class():
+    required = {
+        "connection_page",
+        "scan_page",
+        "submit_page",
+        "diagnostics_page",
+        "ssh",
+        "choose_key",
+        "test_save",
+        "scan",
+        "populate",
+        "submit",
+        "populate_jobs_table",
+        "selected_job",
+        "retrieve_selected_diagnostics",
+        "fetch_selected_logs",
+        "check_selected_session",
+        "refresh_all_job_states",
+        "cancel_selected_blocked_jobs",
+        "closeEvent",
+        "cleanup_index_thread",
+        "on_index_finished",
+        "cancel_scan",
+        "start_index_operation",
+        "search_existing_index",
+    }
+    missing = sorted(name for name in required if not hasattr(Window, name))
+    if missing:
+        raise RuntimeError(
+            "Mac GUI is incomplete. Missing Window methods: "
+            + ", ".join(missing)
         )
 
 
 def main():
+    validate_window_class()
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     window = Window()

@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.0
+
+- Added persistent Mac-side SQLite indexing for Firebird scans.
+- Added background-thread index rebuilds and cancellation.
+- Added fast Search Existing Index mode.
+- Fixed nested threshold-array editing.
+- Added Mac and Firebird TOML validation.
+- Changed Background to the minimum intensity threshold; maximum is preserved.
+
+
+## 0.6.1
+
+- Fixed the Mac GUI class structure introduced in v0.6.0.
+- Restored `choose_key`, SSH, scan, submission, and diagnostic methods as members of `Window`.
+- Added startup validation for all required GUI methods.
+- Added a safe Mac replacement helper that preserves user configuration.
+
+
 ## 0.6.0
 
 - Routed every SLURM stdout/stderr file into the corresponding run folder.

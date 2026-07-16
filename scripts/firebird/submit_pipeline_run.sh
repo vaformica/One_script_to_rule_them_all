@@ -15,6 +15,24 @@ LOG_DIR="$PIPELINE_RUN_DIR/logs"
 
 mkdir -p "$LOG_DIR"
 
+
+VALIDATOR="$PIPELINE_REPO_ROOT/scripts/firebird/validate_run_toml.py"
+VALIDATOR_PYTHON="${IDTRACKER_PYTHON:-$HOME/miniconda3/envs/${IDTRACKER_CONDA_ENV:-idtrackerai}/bin/python}"
+
+if [[ ! -x "$VALIDATOR_PYTHON" ]]; then
+  echo "IDtracker Python not found: $VALIDATOR_PYTHON" >&2
+  exit 20
+fi
+if [[ ! -f "$VALIDATOR" ]]; then
+  echo "TOML validator not found: $VALIDATOR" >&2
+  exit 20
+fi
+
+"$VALIDATOR_PYTHON" "$VALIDATOR" "$PIPELINE_TOML" || {
+  echo "TOML preflight failed. No SLURM jobs were submitted." >&2
+  exit 21
+}
+
 ID_JOB="$(
   sbatch --parsable \
     --output="$LOG_DIR/idtracker_%j.out" \
