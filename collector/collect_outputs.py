@@ -67,13 +67,14 @@ def build_html(qc):
   img=r.get('track_preview',''); dec=r.get('qc_decision','PENDING')
   cards.append(f'<article><a href="{html.escape(img)}"><img src="{html.escape(img)}"></a><h3>{html.escape(r.get("record_id",""))}</h3><p>{html.escape(r.get("video",""))} · {html.escape(r.get("cell",""))}</p><strong>{html.escape(dec)}</strong><p>{html.escape(r.get("notes",""))}</p></article>')
  (qc/'QC_Report.html').write_text('<!doctype html><meta charset="utf-8"><title>Pipeline QC</title><style>body{font-family:Arial;margin:24px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px}article{border:2px solid #999;padding:10px;border-radius:10px}img{width:100%;height:240px;object-fit:contain;background:#eee}</style><h1>IDtracker Pipeline QC</h1><p>Use the Mac GUI QC tab to mark runs DONE or RERUN.</p><div class="grid">'+''.join(cards)+'</div>',encoding='utf-8')
-QC_FIELDS=['record_id','run_index','video','cell','analysis','pipeline_status','qc_decision','track_preview','track_pdf','run_dir','notes','date_run','collected_at']
+QC_FIELDS=['record_id','run_index','video','cell','analysis','pipeline_status','qc_decision','track_preview','track_pdf','run_dir','notes','date_run','collected_at','replaces','replaced_by']
 def normalize_status_row(raw):
  row={key:'' for key in QC_FIELDS}
  for key in QC_FIELDS:
   if key in raw and raw.get(key) is not None: row[key]=raw.get(key,'')
  row['pipeline_status']=row['pipeline_status'] or raw.get('status','') or raw.get('post','')
- row['qc_decision']=row['qc_decision'] or raw.get('qc','') or 'PENDING'
+ row['qc_decision']=(row['qc_decision'] or raw.get('qc','') or 'PENDING').upper()
+ if row['qc_decision']=='FIXED': row['qc_decision']='SUPERSEDED'
  row['track_preview']=row['track_preview'] or raw.get('track_map','')
  if not row['date_run']:
   row['date_run']=raw.get('run_timestamp','') or raw.get('collected_at','')

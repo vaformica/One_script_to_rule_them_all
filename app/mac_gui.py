@@ -745,10 +745,17 @@ class Window(QMainWindow):
 
     def qc_page(self):
         page=QWidget();layout=QVBoxLayout(page)
-        note=QLabel("Review completed runs. DONE adds that run to the appropriate master individual-summary spreadsheet; RERUN excludes it. Fight tracks download as one PDF per fight. BA tracks remain PNG files.");note.setWordWrap(True);layout.addWidget(note)
-        self.qc_table=QTableWidget(0,8);self.qc_table.setHorizontalHeaderLabels(["Record ID","Date run","Analysis","Video","Cell","Pipeline","QC decision","Run folder"]);self.qc_table.setSelectionBehavior(QAbstractItemView.SelectRows);self.qc_table.setSortingEnabled(True);self.qc_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents);self.qc_table.horizontalHeader().setSectionResizeMode(7,QHeaderView.Stretch);layout.addWidget(self.qc_table)
+        note=QLabel("Review completed runs. APPROVED adds a run to the appropriate master spreadsheet. NEEDS RERUN and RERUNNING remain excluded. When a newer replacement is approved, older matching rerun records are automatically marked SUPERSEDED.");note.setWordWrap(True);layout.addWidget(note)
+
+        filters=QHBoxLayout();filters.addWidget(QLabel("Search/filter:"))
+        self.qc_filter=QLineEdit();self.qc_filter.setPlaceholderText("Type any part of a record ID, date, camera/video name, cell, or status")
+        self.qc_filter.textChanged.connect(self.apply_qc_filter);filters.addWidget(self.qc_filter,1)
+        self.qc_status_filter=QComboBox();self.qc_status_filter.addItems(["All statuses","PENDING","APPROVED","NEEDS RERUN","RERUNNING","SUPERSEDED"]);self.qc_status_filter.currentTextChanged.connect(self.apply_qc_filter);filters.addWidget(self.qc_status_filter)
+        clear=QPushButton("Clear Filter");clear.clicked.connect(lambda:(self.qc_filter.clear(),self.qc_status_filter.setCurrentIndex(0)));filters.addWidget(clear);layout.addLayout(filters)
+
+        self.qc_table=QTableWidget(0,10);self.qc_table.setHorizontalHeaderLabels(["Record ID","Date run","Analysis","Video / Camera","Cell","Pipeline","QC status","Replaces","Replaced by","Run folder"]);self.qc_table.setSelectionBehavior(QAbstractItemView.SelectRows);self.qc_table.setSortingEnabled(True);self.qc_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents);self.qc_table.horizontalHeader().setSectionResizeMode(9,QHeaderView.Stretch);layout.addWidget(self.qc_table)
         row=QHBoxLayout()
-        for label,fn in [("Refresh QC",self.refresh_qc),("Mark DONE",lambda:self.set_qc_decision('DONE')),("Mark NEEDS RERUN",lambda:self.set_qc_decision('RERUN')),("Mark Pending",lambda:self.set_qc_decision('PENDING')),("Download Selected",self.download_selected_qc),("View Files",self.view_selected_qc_files),("Download Master Spreadsheets",self.download_master_spreadsheets)]:
+        for label,fn in [("Refresh QC",self.refresh_qc),("Approve",lambda:self.set_qc_decision('APPROVED')),("Needs Rerun",lambda:self.set_qc_decision('RERUN')),("Mark Rerunning",lambda:self.set_qc_decision('RERUNNING')),("Mark Superseded",lambda:self.set_qc_decision('SUPERSEDED')),("Mark Pending",lambda:self.set_qc_decision('PENDING')),("Download Selected",self.download_selected_qc),("View Files",self.view_selected_qc_files),("Download Masters",self.download_master_spreadsheets)]:
             b=QPushButton(label);b.clicked.connect(fn);row.addWidget(b)
         layout.addLayout(row);self.qc_message=QLabel('');self.qc_message.setWordWrap(True);layout.addWidget(self.qc_message);return page
 
@@ -758,12 +765,24 @@ class Window(QMainWindow):
             import csv,io
             rows=list(csv.DictReader(io.StringIO(text))) if text.strip() else []
             self.qc_rows=rows;self.qc_table.setSortingEnabled(False);self.qc_table.setRowCount(len(rows))
+            labels={'DONE':'APPROVED','RERUN':'NEEDS RERUN'}
             for i,r in enumerate(rows):
-                vals=[r.get('record_id',''),r.get('date_run',''),r.get('analysis',''),r.get('video',''),r.get('cell',''),r.get('pipeline_status',''),r.get('qc_decision','PENDING'),r.get('run_dir','')]
+                status=labels.get((r.get('qc_decision') or 'PENDING').upper(),(r.get('qc_decision') or 'PENDING').upper())
+                vals=[r.get('record_id',''),r.get('date_run',''),r.get('analysis',''),r.get('video',''),r.get('cell',''),r.get('pipeline_status',''),status,r.get('replaces',''),r.get('replaced_by',''),r.get('run_dir','')]
                 for c,v in enumerate(vals):
                     item=QTableWidgetItem(str(v));item.setData(Qt.UserRole,r);self.qc_table.setItem(i,c,item)
-            self.qc_table.setSortingEnabled(True);self.qc_message.setText(f"Loaded {len(rows)} collected runs.")
+            self.qc_table.setSortingEnabled(True);self.apply_qc_filter();self.qc_message.setText(f"Loaded {len(rows)} collected runs.")
         except Exception as exc: QMessageBox.critical(self,'QC refresh failed',str(exc))
+
+    def apply_qc_filter(self):
+        if not hasattr(self,'qc_table'): return
+        needle=(self.qc_filter.text() if hasattr(self,'qc_filter') else '').strip().lower()
+        selected=(self.qc_status_filter.currentText() if hasattr(self,'qc_status_filter') else 'All statuses').upper()
+        for row in range(self.qc_table.rowCount()):
+            hay=' '.join((self.qc_table.item(row,c).text() if self.qc_table.item(row,c) else '') for c in range(self.qc_table.columnCount())).lower()
+            status=(self.qc_table.item(row,6).text() if self.qc_table.item(row,6) else '').upper()
+            visible=(not needle or needle in hay) and (selected=='ALL STATUSES' or status==selected)
+            self.qc_table.setRowHidden(row,not visible)
 
     def selected_qc(self):
         rows=self.qc_table.selectionModel().selectedRows() if hasattr(self,'qc_table') else []
@@ -774,7 +793,7 @@ class Window(QMainWindow):
         if not rec:return
         try:
             cmd=f"{shlex.quote(self.repo_root.text().rstrip('/')+'/scripts/firebird/set_qc_status.sh')} {shlex.quote(self.project_root.text())} {shlex.quote(rec['record_id'])} {decision}"
-            result=self.ssh().run(cmd);self.qc_message.setText(f"{rec['record_id']} marked {decision}. Masters rebuilt: {result.strip()}");self.refresh_qc()
+            result=self.ssh().run(cmd);self.qc_message.setText(f"{rec['record_id']} marked {decision}. {result.strip()}");self.refresh_qc()
         except Exception as exc: QMessageBox.critical(self,'QC update failed',str(exc))
 
     def _download_remote(self,remote_path,local_name):

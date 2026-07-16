@@ -213,18 +213,24 @@ def run(args) -> int:
         output_root / "postprocessing_manifest.csv",
         index=False,
     )
-    merge_csvs(
-        ba_summaries,
-        output_root / "ba_individual_summary_all.csv",
-    )
-    merge_csvs(
-        fight_pair_summaries,
-        output_root / "combat_pair_summary_all.csv",
-    )
-    merge_csvs(
-        fight_individual_summaries,
-        output_root / "combat_individual_summary_all.csv",
-    )
+    # Create only summaries appropriate to the analysis actually found.
+    # Fight-only runs must not emit an empty BA summary, and BA-only runs must
+    # not emit empty combat summaries.
+    ba_destination = output_root / "ba_individual_summary_all.csv"
+    fight_pair_destination = output_root / "combat_pair_summary_all.csv"
+    fight_individual_destination = output_root / "combat_individual_summary_all.csv"
+    if ba_summaries:
+        merge_csvs(ba_summaries, ba_destination)
+    elif ba_destination.exists():
+        ba_destination.unlink()
+    if fight_pair_summaries:
+        merge_csvs(fight_pair_summaries, fight_pair_destination)
+    elif fight_pair_destination.exists():
+        fight_pair_destination.unlink()
+    if fight_individual_summaries:
+        merge_csvs(fight_individual_summaries, fight_individual_destination)
+    elif fight_individual_destination.exists():
+        fight_individual_destination.unlink()
 
     summary = {
         "sessions_found": len(sessions),

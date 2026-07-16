@@ -1,3 +1,19 @@
+# Changelog
+
+## v0.9.6
+
+- Corrected fight left/right classification to represent each beetle's **starting side**.
+- Starting X is the median valid X coordinate in the first 30 analyzed frames by default.
+- Added `--starting-position-frames` for explicit control.
+- Replaced mean-position output columns with clearly named starting-position columns.
+- v0.9.5 remains the source baseline for this targeted correction.
+
+## v0.9.5
+- Added mean-X left/right identity columns to fight individual and pair summaries.
+- Printed the run name directly beneath the legend on every track image and PDF page.
+- Fight runs no longer create BA summary files; BA runs no longer create fight summary files.
+- Preserved v0.9.4 as the confirmed source baseline.
+
 ## v0.9.3
 - Track images now visibly contain camera, run, date, video, cell, and record ID.
 - Fight PDF pages inherit the same visible labels.
@@ -134,3 +150,6 @@
 - BA QC continues to use PNG track maps.
 - Changed the default window length from 7200 to 7500 frames across active and legacy entry points.
 - Preserved v0.9.1 as the confirmed rollback/source baseline.
+
+## 0.9.4
+- Added QC lifecycle statuses, automatic superseding, replacement provenance, and text/status filtering.

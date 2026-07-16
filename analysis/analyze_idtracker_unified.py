@@ -988,9 +988,19 @@ def plot_tracks(
                     h2.append(h); l2.append(lab); seen.add(lab)
             ax.legend(h2, l2, frameon=False, fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=2)
 
+    def finalize_figure(fig):
+        run_name = str(getattr(args, "map_run_name", "") or "").strip()
+        if run_name:
+            fig.text(
+                0.5, 0.018,
+                f"Run: {run_name}",
+                ha="center", va="bottom", fontsize=9, fontweight="bold",
+            )
+        fig.tight_layout(rect=[0, 0.16 if run_name else 0.10, 1, 1])
+
     fig, ax = plt.subplots(figsize=(8, 8))
     draw_one(ax, list(range(len(xys))), ("Behavioral assay track" if len(xys) == 1 else "Fight tracks: both beetles"))
-    fig.tight_layout(rect=[0, 0.10, 1, 1])
+    finalize_figure(fig)
     fig.savefig(path_png, dpi=200)
     plt.close(fig)
 
@@ -1000,14 +1010,14 @@ def plot_tracks(
         indiv_png = path_png.with_name(f"{path_png.stem}_animal{i}{path_png.suffix}")
         fig, ax = plt.subplots(figsize=(8, 8))
         draw_one(ax, [i], ((f"Behavioral assay track: animal_{i}") if len(xys) == 1 else f"Fight track: animal_{i}"))
-        fig.tight_layout(rect=[0, 0.10, 1, 1])
+        finalize_figure(fig)
         fig.savefig(indiv_png, dpi=200)
         plt.close(fig)
 
     with PdfPages(path_pdf) as pdf:
         fig, ax = plt.subplots(figsize=(8, 8))
         draw_one(ax, list(range(len(xys))), ("Behavioral assay track" if len(xys) == 1 else "Fight tracks: both beetles"))
-        fig.tight_layout(rect=[0, 0.10, 1, 1])
+        finalize_figure(fig)
         pdf.savefig(fig)
         plt.close(fig)
         for i in range(len(xys)):
@@ -1229,11 +1239,44 @@ def process_session(args: argparse.Namespace) -> Tuple[Path, Optional[Path]]:
         interp_masks.append(imask)
         onset_indices.append(onset_idx)
 
+    # For fights, classify animals by where they STARTED, not by where they
+    # spent most of the assay.  We use the median valid X coordinate within the
+    # first configurable number of analyzed frames.  The median makes the
+    # starting-side assignment resistant to one-frame tracking jitter while
+    # retaining the meaning of "starting position".
+    starting_side_by_position: Dict[int, str] = {}
+    starting_x_by_position: Dict[int, float] = {}
+    starting_position_frames = max(1, int(args.starting_position_frames))
+    if analysis_type == "fight" and len(xys) >= 2:
+        for position, xy in enumerate(xys[:2]):
+            initial_x = np.asarray(xy[:starting_position_frames, 0], dtype=float)
+            valid_initial_x = initial_x[np.isfinite(initial_x)]
+            starting_x_by_position[position] = (
+                float(np.median(valid_initial_x))
+                if len(valid_initial_x)
+                else float("nan")
+            )
+        x0 = starting_x_by_position[0]
+        x1 = starting_x_by_position[1]
+        if np.isfinite(x0) and np.isfinite(x1):
+            if x0 <= x1:
+                starting_side_by_position = {0: "left", 1: "right"}
+            else:
+                starting_side_by_position = {0: "right", 1: "left"}
+        else:
+            starting_side_by_position = {0: "unknown", 1: "unknown"}
+        for position, summary in enumerate(summaries[:2]):
+            summary["starting_side"] = starting_side_by_position[position]
+            summary["starting_x_position_px"] = starting_x_by_position[position]
+            summary["starting_position_window_frames"] = starting_position_frames
+
     png_path = output_dir / f"{prefix}_track_map.png"
     pdf_path = output_dir / f"{prefix}_tracks.pdf"
     args.map_analysis_label = (
         "Behavioral assay" if analysis_type == "ba" else "Fight"
     )
+    # Printed directly beneath the legend on every PNG and PDF page.
+    args.map_run_name = prefix
     plot_tracks(
         xys,
         turt_masks,
@@ -1288,6 +1331,29 @@ def process_session(args: argparse.Namespace) -> Tuple[Path, Optional[Path]]:
     pair_summary["analysis_type"] = analysis_type
     pair_summary["animal0_index_0_based"] = animal_indices[0]
     pair_summary["animal1_index_0_based"] = animal_indices[1]
+    pair_summary["animal0_starting_x_position_px"] = starting_x_by_position.get(0, np.nan)
+    pair_summary["animal1_starting_x_position_px"] = starting_x_by_position.get(1, np.nan)
+    pair_summary["starting_position_window_frames"] = starting_position_frames
+    pair_summary["left_starting_animal_index_0_based"] = (
+        animal_indices[0] if starting_side_by_position.get(0) == "left"
+        else animal_indices[1] if starting_side_by_position.get(1) == "left"
+        else np.nan
+    )
+    pair_summary["right_starting_animal_index_0_based"] = (
+        animal_indices[0] if starting_side_by_position.get(0) == "right"
+        else animal_indices[1] if starting_side_by_position.get(1) == "right"
+        else np.nan
+    )
+    pair_summary["left_starting_analysis_role"] = (
+        "animal0" if starting_side_by_position.get(0) == "left"
+        else "animal1" if starting_side_by_position.get(1) == "left"
+        else "unknown"
+    )
+    pair_summary["right_starting_analysis_role"] = (
+        "animal0" if starting_side_by_position.get(0) == "right"
+        else "animal1" if starting_side_by_position.get(1) == "right"
+        else "unknown"
+    )
 
     pair_summary_path = output_dir / f"{prefix}_combat_pair_summary.csv"
     pair_frame_path = output_dir / f"{prefix}_per_frame_pairwise.csv"
@@ -1345,6 +1411,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--move-threshold-px", type=float, default=30.0, help="Displacement threshold for movement onset.")
     p.add_argument("--movement-onset-consecutive-frames", type=int, default=30, help="Consecutive frames needed for sustained movement onset.")
+    p.add_argument("--starting-position-frames", type=int, default=30, help="Fight only: classify starting left/right side from the median valid X coordinate in the first N analyzed frames (default: 30).")
     p.add_argument("--max-step-px", type=float, default=50.0, help="Large frame-to-frame jump threshold for artifact interpolation.")
     p.add_argument("--interpolation-warning-fraction", type=float, default=0.05, help="Interpolated-frame fraction that triggers QC warning.")
     p.add_argument("--interpolation-warning-frames", type=int, default=300, help="Interpolated-frame count that triggers QC warning.")
