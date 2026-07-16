@@ -1,6 +1,8 @@
 from __future__ import annotations
 import json
 import math
+import csv
+import io
 import sqlite3
 import time
 import shlex
@@ -8,6 +10,13 @@ import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
+
+# Allow direct execution as well as ``python -m app.mac_gui``.
+# When a package module is run by filename, Python otherwise places only the
+# app/ directory on sys.path, so imports such as ``app.approval_matching`` fail.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from PyQt5.QtCore import Qt, QObject, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
@@ -18,9 +27,10 @@ from PyQt5.QtWidgets import (
     QRadioButton, QButtonGroup
 )
 import tomlkit
+from app.approval_matching import approval_key, apply_approvals
 
 
-BASE = Path(__file__).resolve().parents[1]
+BASE = REPO_ROOT
 CONFIG = BASE / "config/user.json"
 DEFAULT = BASE / "config/default.json"
 
@@ -300,11 +310,12 @@ class IndexWorker(QObject):
     failed = pyqtSignal(str)
     cancelled = pyqtSignal()
 
-    def __init__(self, host, key, search_root, db_path, rebuild):
+    def __init__(self, host, key, search_root, project_root, db_path, rebuild):
         super().__init__()
         self.host = host
         self.key = key
         self.search_root = search_root
+        self.project_root = project_root.rstrip("/")
         self.db_path = db_path
         self.rebuild = rebuild
         self._cancelled = False
@@ -312,10 +323,31 @@ class IndexWorker(QObject):
     def cancel(self):
         self._cancelled = True
 
+    def _load_approved_runs(self, ssh):
+        if not self.project_root:
+            return {}
+        path = self.project_root + "/QC/run_status.csv"
+        text = ssh.run(f"cat -- {shlex.quote(path)} 2>/dev/null || true")
+        approved = {}
+        if not text.strip():
+            return approved
+        for record in csv.DictReader(io.StringIO(text)):
+            decision = (record.get("qc_decision") or "").strip().upper()
+            if decision not in {"APPROVED", "DONE"}:
+                continue
+            key = approval_key(record.get("video"), record.get("cell"), record.get("analysis"))
+            rank = (record.get("date_run", ""), record.get("run_index", ""))
+            current = approved.get(key)
+            if current is None or rank >= current[0]:
+                approved[key] = (rank, record)
+        return {key: value[1] for key, value in approved.items()}
+
     def run(self):
         index = None
         try:
             index = LocalIndex(self.db_path)
+            ssh = SSH(self.host, self.key)
+            approved = self._load_approved_runs(ssh)
 
             if not self.rebuild:
                 rows, summary = index.load(self.search_root)
@@ -325,6 +357,7 @@ class IndexWorker(QObject):
                         "Use Rebuild Firebird Index first."
                     )
                 video_count, toml_count, matched_count, indexed_at = summary
+                rows = apply_approvals(rows, approved)
                 self.finished.emit(
                     rows,
                     int(video_count),
@@ -334,7 +367,6 @@ class IndexWorker(QObject):
                 )
                 return
 
-            ssh = SSH(self.host, self.key)
             self.progress.emit("Recursively listing videos and TOMLs on Firebird...")
 
             find_command = (
@@ -493,6 +525,7 @@ class IndexWorker(QObject):
                         "reason": str(exc),
                     })
 
+            rows = apply_approvals(rows, approved)
             index.replace(
                 self.search_root,
                 rows,
@@ -567,7 +600,8 @@ class Window(QMainWindow):
         note = QLabel(
             "Rebuild Firebird Index performs the remote recursive scan and "
             "stores parsed matches in a local SQLite index on this Mac. "
-            "Search Existing Index reuses that local index without rescanning."
+            "Search Existing Index reuses that local index without rescanning. "
+            "Both actions refresh approval status from the QC master index on Firebird."
         )
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -603,9 +637,15 @@ class Window(QMainWindow):
         selection = QHBoxLayout()
         for label, action in [("Check All", self.check_all), ("Uncheck All", self.uncheck_all), ("Invert Selection", self.invert_selection)]:
             b = QPushButton(label); b.clicked.connect(action); selection.addWidget(b)
-        selection.addStretch(); layout.addLayout(selection)
+        selection.addStretch()
+        selection.addWidget(QLabel("Approved runs:"))
+        self.approved_filter = QComboBox()
+        self.approved_filter.addItems(["Show all", "Hide approved", "Approved only"])
+        self.approved_filter.currentTextChanged.connect(self.apply_scan_filter)
+        selection.addWidget(self.approved_filter)
+        layout.addLayout(selection)
 
-        self.table = QTableWidget(0, 10)
+        self.table = QTableWidget(0, 11)
         self.table.setSortingEnabled(True)
         self.table.setAlternatingRowColors(True)
         self.table.setHorizontalHeaderLabels([
@@ -617,6 +657,7 @@ class Window(QMainWindow):
             "Blob min",
             "Blob max",
             "Background threshold min",
+            "Approved run",
             "Status",
             "Reason",
         ])
@@ -624,7 +665,7 @@ class Window(QMainWindow):
             QHeaderView.ResizeToContents
         )
         self.table.horizontalHeader().setSectionResizeMode(
-            9,
+            10,
             QHeaderView.Stretch,
         )
         layout.addWidget(self.table)
@@ -632,6 +673,8 @@ class Window(QMainWindow):
 
     def _set_checks(self, mode):
         for i in range(self.table.rowCount()):
+            if self.table.isRowHidden(i):
+                continue
             item=self.table.item(i,0)
             if item:
                 if mode=='invert': item.setCheckState(Qt.Unchecked if item.checkState()==Qt.Checked else Qt.Checked)
@@ -907,6 +950,7 @@ class Window(QMainWindow):
             self.host.text().strip(),
             self.key.text().strip(),
             search_root,
+            self.project_root.text().strip(),
             self.index_db_path,
             rebuild,
         )
@@ -947,9 +991,11 @@ class Window(QMainWindow):
         timestamp = datetime.fromtimestamp(indexed_at).strftime(
             "%Y-%m-%d %H:%M:%S"
         )
+        approved_count = sum(bool(row.get("approved")) for row in rows)
         self.summary.setText(
             f"Index dated {timestamp}: {video_count:,} videos, "
-            f"{toml_count:,} TOMLs, {matched_count:,} exact matches."
+            f"{toml_count:,} TOMLs, {matched_count:,} exact matches; "
+            f"{approved_count:,} already approved."
         )
         self.finish_index_ui()
 
@@ -991,9 +1037,27 @@ class Window(QMainWindow):
             combo.addItems(["ba", "fight"])
             combo.setCurrentText(row["analysis"])
             self.table.setCellWidget(i, 4, combo)
-            for c, key in ((5, "area_min"), (6, "area_max"), (7, "background_min"), (8, "status"), (9, "reason")):
+            approved_text = ""
+            if row.get("approved"):
+                approved_text = row.get("approved_date", "") or "APPROVED"
+                if row.get("approved_record_id"):
+                    approved_text += f" | {row['approved_record_id']}"
+            self.table.setItem(i, 8, QTableWidgetItem(approved_text))
+            for c, key in ((5, "area_min"), (6, "area_max"), (7, "background_min"), (9, "status"), (10, "reason")):
                 self.table.setItem(i, c, QTableWidgetItem(str(row[key])))
         self.table.setSortingEnabled(True)
+        self.apply_scan_filter()
+
+    def apply_scan_filter(self):
+        if not hasattr(self, "table") or not hasattr(self, "approved_filter"):
+            return
+        mode = self.approved_filter.currentText()
+        for table_row in range(self.table.rowCount()):
+            item = self.table.item(table_row, 0)
+            data = item.data(Qt.UserRole) if item else {}
+            approved = bool(data.get("approved")) if isinstance(data, dict) else False
+            hidden = (mode == "Hide approved" and approved) or (mode == "Approved only" and not approved)
+            self.table.setRowHidden(table_row, hidden)
 
     def postprocess_args(self, analysis):
         p=self.param

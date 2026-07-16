@@ -1,4 +1,25 @@
+# v0.9.13 — macOS package import fix
+
+- Added `app/__init__.py` so `app` is an explicit Python package.
+- Changed the macOS launcher to run the GUI with `python -m app.mac_gui`.
+- Added a repository-root path fallback in `mac_gui.py` so direct execution also works.
+
 # Changelog
+
+## 0.9.12
+
+- Scan & Match now refreshes approved-run status from `QC/run_status.csv`, the canonical index used to build the approved master spreadsheets.
+- TOMLs are matched to approved runs by exact video filename, cell label, and analysis type.
+- Added an **Approved run** column showing the approval date and record ID.
+- Added **Show all**, **Hide approved**, and **Approved only** filters.
+- Check All, Uncheck All, and Invert Selection now affect only visible rows, making it safe to hide approved runs before selecting work.
+
+## 0.9.11
+- Added an x-y-time 3-D trajectory map to every behavioral-assay run.
+- Added the BA 3-D map to the analysis-generated multipage track PDF.
+- Made the collector preserve and surface BA track PDFs in QC, matching fight behavior.
+- Kept BA PNG maps as supplementary QC files while making the PDF the primary review artifact.
+- Standardized the 3-D title and colors for BA and fight analyses.
 
 ## 0.9.8
 - Refined the fight-only 3-D space-time track page to use an idTracker-style corner view.

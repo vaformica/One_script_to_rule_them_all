@@ -1015,7 +1015,7 @@ def plot_tracks(
             ax.legend(h2, l2, frameon=False, fontsize=8, loc="upper center",
                       bbox_to_anchor=(0.5, -0.12), ncol=2)
 
-    def draw_interaction_3d(fig):
+    def draw_track_3d(fig):
         """Draw an idTracker-style corner view of x-y movement through time.
 
         The animal identity colors are retained throughout the entire trajectory.
@@ -1024,7 +1024,7 @@ def plot_tracks(
         than a flat x-y chart with a third axis added afterward.
         """
         ax = fig.add_subplot(111, projection="3d")
-        colors = [args.animal0_color, args.animal1_color]
+        colors = [args.animal0_color, args.animal1_color, "tab:green", "tab:purple"]
         fps = float(args.fps) if args.fps else 1.0
 
         # Draw the arena/ROI footprint on the floor of the 3-D plot.
@@ -1043,7 +1043,7 @@ def plot_tracks(
 
         # Plot each animal as segmented colored paths so NaNs and large jumps do
         # not create misleading straight lines through the 3-D volume.
-        for i in range(min(2, len(xys))):
+        for i in range(len(xys)):
             xy = localize(xys[i])
             t = np.arange(len(xy), dtype=float) / fps
             finite = np.isfinite(xy).all(axis=1)
@@ -1099,10 +1099,11 @@ def plot_tracks(
         ax.set_xlabel(xlabel, labelpad=8)
         ax.set_ylabel(ylabel, labelpad=8)
         ax.set_zlabel("time from analysis start (s)", labelpad=8)
-        ax.set_title("Fight tracks through time (corner view)", pad=16)
+        analysis_label = "Behavioral assay" if len(xys) == 1 else "Fight"
+        ax.set_title(f"{analysis_label} tracks through time (corner view)", pad=16)
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymax, ymin)  # Match the image-coordinate orientation of 2-D maps.
-        max_len = max((len(xy) for xy in xys[:2]), default=1)
+        max_len = max((len(xy) for xy in xys), default=1)
         ax.set_zlim(0, max(1.0, (max_len - 1) / fps))
 
         # Tall box and oblique corner view closely mimic the classic idTracker plot.
@@ -1162,12 +1163,14 @@ def plot_tracks(
         fig.savefig(interaction_png, dpi=200)
         plt.close(fig)
 
-        interaction_3d_png = path_png.with_name(f"{path_png.stem}_interactions_3d{path_png.suffix}")
-        fig = plt.figure(figsize=(9, 8))
-        draw_interaction_3d(fig)
-        finalize_figure(fig)
-        fig.savefig(interaction_3d_png, dpi=200)
-        plt.close(fig)
+    # Every analysis receives an x-y-time view. Previously this was generated
+    # only for fights because it was nested under the interaction-map branch.
+    track_3d_png = path_png.with_name(f"{path_png.stem}_3d{path_png.suffix}")
+    fig = plt.figure(figsize=(9, 8))
+    draw_track_3d(fig)
+    finalize_figure(fig)
+    fig.savefig(track_3d_png, dpi=200)
+    plt.close(fig)
 
     with PdfPages(path_pdf) as pdf:
         fig, ax = plt.subplots(figsize=(8, 8))
@@ -1187,11 +1190,11 @@ def plot_tracks(
             finalize_figure(fig)
             pdf.savefig(fig)
             plt.close(fig)
-            fig = plt.figure(figsize=(9, 8))
-            draw_interaction_3d(fig)
-            finalize_figure(fig)
-            pdf.savefig(fig)
-            plt.close(fig)
+        fig = plt.figure(figsize=(9, 8))
+        draw_track_3d(fig)
+        finalize_figure(fig)
+        pdf.savefig(fig)
+        plt.close(fig)
 
 
 def load_metadata_table(path: Optional[str]) -> Optional[pd.DataFrame]:
@@ -1495,7 +1498,12 @@ def process_session(args: argparse.Namespace) -> Tuple[Path, Optional[Path]]:
             (
                 png_path.name,
                 "one image per session",
-                "Shared standardized ROI-local track map",
+                "Detailed ROI-local 2-D track map with start, end, onset, interpolation, and turtling markers",
+            ),
+            (
+                pdf_path.name,
+                "multipage PDF per session",
+                "BA QC packet containing the detailed 2-D map, animal map, and x-y-time 3-D track map",
             ),
         ]
         pd.DataFrame(
