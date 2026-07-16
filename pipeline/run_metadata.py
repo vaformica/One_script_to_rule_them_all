@@ -18,6 +18,7 @@ class RunMetadata:
     cell_label: str
     remote_run_dir: str
     session_path: str = ""
+    record_id: str = ""
     idtracker_job_id: str = ""
     postprocess_job_id: str = ""
     collector_job_id: str = ""
@@ -45,8 +46,17 @@ class RunMetadata:
             encoding="utf-8",
         )
 
+    def identifier(self) -> str:
+        if self.record_id:
+            return self.record_id
+        stamp = "".join(c for c in self.run_timestamp if c.isdigit())
+        video = Path(self.video_filename).stem
+        safe = lambda x: "".join(c if c.isalnum() or c in "-_" else "_" for c in str(x))
+        return f"{safe(video)}_{safe(self.cell_label)}_R{self.run_index:05d}_{stamp}"
+
     def csv_columns(self) -> dict[str, Any]:
         return {
+            "pipeline_record_id": self.identifier(),
             "pipeline_run_index": self.run_index,
             "pipeline_run_timestamp": self.run_timestamp,
             "pipeline_analysis_type": self.analysis_type,
@@ -66,6 +76,6 @@ class RunMetadata:
 
     def png_label(self) -> str:
         return (
-            f"Run {self.run_index:05d} | {self.run_timestamp} | "
+            f"ID {self.identifier()} | Run {self.run_index:05d} | {self.run_timestamp} | "
             f"{self.analysis_type} | {self.video_filename} | Cell {self.cell_label}"
         )

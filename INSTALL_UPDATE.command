@@ -36,7 +36,8 @@ MAC_PY="$HOME/miniconda3/envs/$MAC_ENV/bin/python"
   "$ROOT/pipeline/session_locator.py" \
   "$ROOT/processors/dispatch.py" \
   "$ROOT/processors/run_unified_pipeline.py" \
-  "$ROOT/collector/collect_outputs.py"
+  "$ROOT/collector/collect_outputs.py" \
+  "$ROOT/collector/qc_manager.py"
 
 echo "Mac validation passed."
 echo "Syncing code to Firebird..."
@@ -65,6 +66,11 @@ cd "$HOME"
 PYTHONPATH="$ROOT" "$PY" -c "import pipeline, collector, processors; from pipeline.run_metadata import RunMetadata; from collector.metadata_injector import enrich_tree; print('Package imports OK')"
 PYTHONPATH="$ROOT" "$PY" "$ROOT/processors/run_unified_pipeline.py" --help >/dev/null
 PYTHONPATH="$ROOT" "$PY" "$ROOT/collector/collect_outputs.py" --help >/dev/null
+PYTHONPATH="$ROOT" "$PY" "$ROOT/collector/qc_manager.py" --help >/dev/null
+test -x "$ROOT/scripts/firebird/set_qc_status.sh"
+
+# Normalize any QC index created by an earlier pipeline release.
+PYTHONPATH="$ROOT" "$PY" "$ROOT/collector/qc_manager.py" --project-root /data/labs/vformic1-swat-lab/idtracker_pipeline_runs --migrate-index
 
 grep -q 'export PYTHONPATH=' "$ROOT/slurm/postprocess_one_cell.slurm"
 grep -q 'export PYTHONPATH=' "$ROOT/slurm/collect_one_cell.slurm"

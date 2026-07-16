@@ -534,6 +534,7 @@ class Window(QMainWindow):
         tabs.addTab(self.parameters_page(), "3. Parameters")
         tabs.addTab(self.submit_page(), "4. Submit")
         tabs.addTab(self.diagnostics_page(), "5. Jobs and Diagnostics")
+        tabs.addTab(self.qc_page(), "6. QC and Masters")
         self.setCentralWidget(tabs)
 
     def connection_page(self):
@@ -605,6 +606,8 @@ class Window(QMainWindow):
         selection.addStretch(); layout.addLayout(selection)
 
         self.table = QTableWidget(0, 10)
+        self.table.setSortingEnabled(True)
+        self.table.setAlternatingRowColors(True)
         self.table.setHorizontalHeaderLabels([
             "Use",
             "Video",
@@ -722,6 +725,10 @@ class Window(QMainWindow):
         sessions.clicked.connect(self.check_selected_session)
         buttons.addWidget(sessions)
 
+        download = QPushButton("Download Selected Results")
+        download.clicked.connect(self.download_selected_results)
+        buttons.addWidget(download)
+
         cancel_blocked = QPushButton("Cancel Blocked Dependents")
         cancel_blocked.clicked.connect(self.cancel_selected_blocked_jobs)
         buttons.addWidget(cancel_blocked)
@@ -735,6 +742,66 @@ class Window(QMainWindow):
         )
         layout.addWidget(self.diagnostics_output, 1)
         return page
+
+    def qc_page(self):
+        page=QWidget();layout=QVBoxLayout(page)
+        note=QLabel("Review completed runs. DONE adds that run to the appropriate master individual-summary spreadsheet; RERUN excludes it. Fight tracks download as one PDF per fight. BA tracks remain PNG files.");note.setWordWrap(True);layout.addWidget(note)
+        self.qc_table=QTableWidget(0,7);self.qc_table.setHorizontalHeaderLabels(["Record ID","Analysis","Video","Cell","Pipeline","QC decision","Run folder"]);self.qc_table.setSelectionBehavior(QAbstractItemView.SelectRows);self.qc_table.setSortingEnabled(True);self.qc_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents);self.qc_table.horizontalHeader().setSectionResizeMode(6,QHeaderView.Stretch);layout.addWidget(self.qc_table)
+        row=QHBoxLayout()
+        for label,fn in [("Refresh QC",self.refresh_qc),("Mark DONE",lambda:self.set_qc_decision('DONE')),("Mark NEEDS RERUN",lambda:self.set_qc_decision('RERUN')),("Mark Pending",lambda:self.set_qc_decision('PENDING')),("Download Selected",self.download_selected_qc),("Download Master Spreadsheets",self.download_master_spreadsheets)]:
+            b=QPushButton(label);b.clicked.connect(fn);row.addWidget(b)
+        layout.addLayout(row);self.qc_message=QLabel('');self.qc_message.setWordWrap(True);layout.addWidget(self.qc_message);return page
+
+    def refresh_qc(self):
+        try:
+            text=self.ssh().run(f"cat {shlex.quote(self.project_root.text().rstrip('/')+'/QC/run_status.csv')} 2>/dev/null || true")
+            import csv,io
+            rows=list(csv.DictReader(io.StringIO(text))) if text.strip() else []
+            self.qc_rows=rows;self.qc_table.setSortingEnabled(False);self.qc_table.setRowCount(len(rows))
+            for i,r in enumerate(rows):
+                vals=[r.get('record_id',''),r.get('analysis',''),r.get('video',''),r.get('cell',''),r.get('pipeline_status',''),r.get('qc_decision','PENDING'),r.get('run_dir','')]
+                for c,v in enumerate(vals):
+                    item=QTableWidgetItem(str(v));item.setData(Qt.UserRole,r);self.qc_table.setItem(i,c,item)
+            self.qc_table.setSortingEnabled(True);self.qc_message.setText(f"Loaded {len(rows)} collected runs.")
+        except Exception as exc: QMessageBox.critical(self,'QC refresh failed',str(exc))
+
+    def selected_qc(self):
+        rows=self.qc_table.selectionModel().selectedRows() if hasattr(self,'qc_table') else []
+        return self.qc_table.item(rows[0].row(),0).data(Qt.UserRole) if rows else None
+
+    def set_qc_decision(self,decision):
+        rec=self.selected_qc()
+        if not rec:return
+        try:
+            cmd=f"{shlex.quote(self.repo_root.text().rstrip('/')+'/scripts/firebird/set_qc_status.sh')} {shlex.quote(self.project_root.text())} {shlex.quote(rec['record_id'])} {decision}"
+            result=self.ssh().run(cmd);self.qc_message.setText(f"{rec['record_id']} marked {decision}. Masters rebuilt: {result.strip()}");self.refresh_qc()
+        except Exception as exc: QMessageBox.critical(self,'QC update failed',str(exc))
+
+    def _download_remote(self,remote_path,local_name):
+        destination=Path.home()/"Downloads"/"IDtracker_Results"/local_name;destination.parent.mkdir(parents=True,exist_ok=True)
+        cmd=['rsync','-av','-e',f'ssh -i {str(Path(self.key.text()).expanduser())}',f'{self.host.text().strip()}:{remote_path.rstrip("/")}/',str(destination)+'/']
+        result=subprocess.run(cmd,capture_output=True,text=True)
+        if result.returncode:raise RuntimeError(result.stderr or result.stdout)
+        return destination
+
+    def download_selected_results(self):
+        job=self.selected_job()
+        if not job:return
+        try:
+            dest=self._download_remote(job['run_dir']+'/outputs',f"{Path(job['run_dir']).name}_outputs");QMessageBox.information(self,'Download complete',f'Results downloaded to:\n{dest}')
+        except Exception as exc:QMessageBox.critical(self,'Download failed',str(exc))
+
+    def download_selected_qc(self):
+        rec=self.selected_qc()
+        if not rec:return
+        try:
+            dest=self._download_remote(rec['run_dir']+'/outputs',rec['record_id']);QMessageBox.information(self,'Download complete',f'Results downloaded to:\n{dest}')
+        except Exception as exc:QMessageBox.critical(self,'Download failed',str(exc))
+
+    def download_master_spreadsheets(self):
+        try:
+            remote=self.project_root.text().rstrip('/')+'/QC/master_summaries';dest=self._download_remote(remote,'Master_Summaries');QMessageBox.information(self,'Download complete',f'Master spreadsheets downloaded to:\n{dest}')
+        except Exception as exc:QMessageBox.critical(self,'Download failed',str(exc))
 
     def ssh(self):
         return SSH(self.host.text().strip(), self.key.text().strip())
@@ -870,11 +937,13 @@ class Window(QMainWindow):
         self.index_thread = None
 
     def populate(self):
+        self.table.setSortingEnabled(False)
         self.table.setRowCount(len(self.rows))
         for i, row in enumerate(self.rows):
             use = QTableWidgetItem()
             use.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
             use.setCheckState(Qt.Checked if row["use"] else Qt.Unchecked)
+            use.setData(Qt.UserRole, row)
             self.table.setItem(i, 0, use)
             for c, key in enumerate(("video", "cell", "toml"), 1):
                 self.table.setItem(i, c, QTableWidgetItem(str(row[key])))
@@ -884,6 +953,7 @@ class Window(QMainWindow):
             self.table.setCellWidget(i, 4, combo)
             for c, key in ((5, "area_min"), (6, "area_max"), (7, "background_min"), (8, "status"), (9, "reason")):
                 self.table.setItem(i, c, QTableWidgetItem(str(row[key])))
+        self.table.setSortingEnabled(True)
 
     def postprocess_args(self, analysis):
         p=self.param
@@ -896,8 +966,13 @@ class Window(QMainWindow):
     def submit(self):
         ssh = self.ssh()
         messages = []
-        for i, row in enumerate(self.rows):
-            if self.table.item(i, 0).checkState() != Qt.Checked:
+        for i in range(self.table.rowCount()):
+            use_item = self.table.item(i, 0)
+            if use_item is None or use_item.checkState() != Qt.Checked:
+                continue
+            row = use_item.data(Qt.UserRole)
+            if not isinstance(row, dict):
+                continue
                 continue
             try:
                 analysis = self.table.cellWidget(i, 4).currentText()
@@ -979,6 +1054,7 @@ class Window(QMainWindow):
                     "cell_label": row["cell"],
                     "remote_run_dir": run_dir,
                     "session_path": "",
+                    "record_id": f"{video_stem}_{row['cell']}_R{run_index:05d}_{stamp}",
                     "parameters": {
                         "area_min": area_min,
                         "area_max": None if math.isinf(area_max) else area_max,

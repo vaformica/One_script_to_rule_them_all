@@ -104,3 +104,19 @@
 - Added Firebird import smoke tests to the installer.
 - Updated the requested default connection, search, output, and repository paths.
 - Added a single `INSTALL_UPDATE.command` that reuses existing Conda environments, syncs to Firebird, installs, and validates the active code.
+
+## 0.9.0
+- Preserves v0.8.4 as the confirmed rollback/source baseline.
+- Adds globally useful record IDs to metadata, CSVs, image labels, and collected filenames.
+- Builds one multi-page track PDF per fight; BA tracks remain PNG files.
+- Adds direct Downloads-folder result downloads from the Mac GUI.
+- Adds a QC tab with DONE, NEEDS RERUN, and PENDING decisions.
+- Rebuilds separate BA and fight master individual-summary CSVs from DONE runs only.
+- Makes the TOML import table sortable without breaking row-to-TOML associations.
+
+## v0.9.1 — QC index migration hotfix
+
+- Automatically normalizes older `QC/run_status.csv` schemas.
+- Preserves prior QC decisions when possible.
+- Writes the QC index atomically to avoid partial files.
+- Prevents legacy columns such as `tracking`, `post`, `archive`, `status`, `qc`, and `track_map` from crashing collection.
