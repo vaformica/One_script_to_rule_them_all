@@ -97,6 +97,15 @@ IDTRACKER_PYTHON="$HOME/miniconda3/envs/$IDTRACKER_ENV/bin/python"
 "$IDTRACKER_PYTHON" -m py_compile \
   "$ROOT/scripts/firebird/validate_run_toml.py"
 
+echo "Testing repository package imports from an external working directory..."
+(
+  cd "$HOME"
+  PYTHONPATH="$ROOT" "$PIPELINE_PYTHON" -c \
+    "import pipeline, collector, processors; from pipeline.run_metadata import RunMetadata; from collector.metadata_injector import enrich_tree; print('Repository imports OK')"
+  PYTHONPATH="$ROOT" "$PIPELINE_PYTHON" "$ROOT/processors/run_unified_pipeline.py" --help >/dev/null
+  PYTHONPATH="$ROOT" "$PIPELINE_PYTHON" "$ROOT/collector/collect_outputs.py" --help >/dev/null
+)
+
 chmod +x \
   "$ROOT/scripts/firebird/"*.sh \
   "$ROOT/scripts/firebird/validate_run_toml.py" \

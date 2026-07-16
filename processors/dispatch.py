@@ -18,6 +18,9 @@ def main():
     args, extra = parser.parse_known_args()
 
     script = Path(__file__).with_name("run_unified_pipeline.py")
+    env = dict(__import__("os").environ)
+    repo_root = str(Path(__file__).resolve().parents[1])
+    env["PYTHONPATH"] = repo_root + ((":" + env["PYTHONPATH"]) if env.get("PYTHONPATH") else "")
     subprocess.run(
         [
             sys.executable,
@@ -29,6 +32,7 @@ def main():
             *extra,
         ],
         check=True,
+        env=env,
     )
 
 

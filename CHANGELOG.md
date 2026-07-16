@@ -96,3 +96,11 @@
 - Session errors now print the TOML, encoded video path, expected session path, and exact missing files.
 - Added `INSTALL_UPDATE.command`, a one-step Mac-to-Firebird installer for the working repository.
 - Existing Mac and Firebird Conda environments are reused and are not recreated during routine code updates.
+
+## v0.8.4
+- Fixed postprocessing and collector imports when SLURM starts jobs outside the repository.
+- Added repository-root `PYTHONPATH` exports to both downstream SLURM scripts.
+- Added direct-execution path protection inside the postprocessing and collector entry points.
+- Added Firebird import smoke tests to the installer.
+- Updated the requested default connection, search, output, and repository paths.
+- Added a single `INSTALL_UPDATE.command` that reuses existing Conda environments, syncs to Firebird, installs, and validates the active code.

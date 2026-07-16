@@ -4,6 +4,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Permit direct execution by absolute file path from any SLURM working directory.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from collector.metadata_injector import enrich_tree
 from pipeline.run_metadata import RunMetadata
 
@@ -37,7 +42,7 @@ def main():
     parser.add_argument("--max-step-px", type=float, default=50.0)
     args, extra = parser.parse_known_args()
 
-    repo_root = Path(__file__).resolve().parents[1]
+    repo_root = REPO_ROOT
     command = [
         sys.executable,
         str(repo_root / "analysis/run_idtracker_unified_batch.py"),

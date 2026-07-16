@@ -14,6 +14,8 @@ set -euo pipefail
 
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate "${POSTPROCESS_CONDA_ENV:-beetle_pipeline}"
+export PYTHONPATH="$PIPELINE_REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+cd "$PIPELINE_REPO_ROOT"
 
 python "$PIPELINE_REPO_ROOT/collector/collect_outputs.py" \
   --run-dir "$PIPELINE_RUN_DIR" \

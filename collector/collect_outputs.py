@@ -2,6 +2,13 @@ from __future__ import annotations
 import argparse,csv,html,json,shutil
 from datetime import datetime
 from pathlib import Path
+import sys
+
+# Permit direct execution by absolute file path from any SLURM working directory.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from PIL import Image
 from pipeline.run_metadata import RunMetadata
 
