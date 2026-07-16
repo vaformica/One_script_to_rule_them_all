@@ -74,8 +74,20 @@ class RunMetadata:
             "pipeline_git_commit": self.git_commit,
         }
 
+    def camera_label(self) -> str:
+        stem = Path(self.video_filename).stem
+        parts = stem.split("_")
+        if len(parts) >= 2 and parts[0].lower() == "camera":
+            return f"Camera {parts[1]}"
+        return "Camera unknown"
+
+    def png_label_lines(self) -> list[str]:
+        return [
+            f"{self.camera_label()}  |  Cell {self.cell_label}  |  {self.analysis_type.upper()}",
+            f"Run {self.run_index:05d}  |  Date run: {self.run_timestamp}",
+            f"Video: {self.video_filename}",
+            f"Record ID: {self.identifier()}",
+        ]
+
     def png_label(self) -> str:
-        return (
-            f"ID {self.identifier()} | Run {self.run_index:05d} | {self.run_timestamp} | "
-            f"{self.analysis_type} | {self.video_filename} | Cell {self.cell_label}"
-        )
+        return " | ".join(self.png_label_lines())

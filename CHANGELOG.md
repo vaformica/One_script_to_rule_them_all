@@ -1,3 +1,9 @@
+## v0.9.3
+- Track images now visibly contain camera, run, date, video, cell, and record ID.
+- Fight PDF pages inherit the same visible labels.
+- Added sortable QC Date run column.
+- Preserved v0.9.2 as the confirmed source baseline.
+
 # Changelog
 
 ## 0.8.2

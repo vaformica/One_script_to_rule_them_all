@@ -746,7 +746,7 @@ class Window(QMainWindow):
     def qc_page(self):
         page=QWidget();layout=QVBoxLayout(page)
         note=QLabel("Review completed runs. DONE adds that run to the appropriate master individual-summary spreadsheet; RERUN excludes it. Fight tracks download as one PDF per fight. BA tracks remain PNG files.");note.setWordWrap(True);layout.addWidget(note)
-        self.qc_table=QTableWidget(0,7);self.qc_table.setHorizontalHeaderLabels(["Record ID","Analysis","Video","Cell","Pipeline","QC decision","Run folder"]);self.qc_table.setSelectionBehavior(QAbstractItemView.SelectRows);self.qc_table.setSortingEnabled(True);self.qc_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents);self.qc_table.horizontalHeader().setSectionResizeMode(6,QHeaderView.Stretch);layout.addWidget(self.qc_table)
+        self.qc_table=QTableWidget(0,8);self.qc_table.setHorizontalHeaderLabels(["Record ID","Date run","Analysis","Video","Cell","Pipeline","QC decision","Run folder"]);self.qc_table.setSelectionBehavior(QAbstractItemView.SelectRows);self.qc_table.setSortingEnabled(True);self.qc_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents);self.qc_table.horizontalHeader().setSectionResizeMode(7,QHeaderView.Stretch);layout.addWidget(self.qc_table)
         row=QHBoxLayout()
         for label,fn in [("Refresh QC",self.refresh_qc),("Mark DONE",lambda:self.set_qc_decision('DONE')),("Mark NEEDS RERUN",lambda:self.set_qc_decision('RERUN')),("Mark Pending",lambda:self.set_qc_decision('PENDING')),("Download Selected",self.download_selected_qc),("View Files",self.view_selected_qc_files),("Download Master Spreadsheets",self.download_master_spreadsheets)]:
             b=QPushButton(label);b.clicked.connect(fn);row.addWidget(b)
@@ -759,7 +759,7 @@ class Window(QMainWindow):
             rows=list(csv.DictReader(io.StringIO(text))) if text.strip() else []
             self.qc_rows=rows;self.qc_table.setSortingEnabled(False);self.qc_table.setRowCount(len(rows))
             for i,r in enumerate(rows):
-                vals=[r.get('record_id',''),r.get('analysis',''),r.get('video',''),r.get('cell',''),r.get('pipeline_status',''),r.get('qc_decision','PENDING'),r.get('run_dir','')]
+                vals=[r.get('record_id',''),r.get('date_run',''),r.get('analysis',''),r.get('video',''),r.get('cell',''),r.get('pipeline_status',''),r.get('qc_decision','PENDING'),r.get('run_dir','')]
                 for c,v in enumerate(vals):
                     item=QTableWidgetItem(str(v));item.setData(Qt.UserRole,r);self.qc_table.setItem(i,c,item)
             self.qc_table.setSortingEnabled(True);self.qc_message.setText(f"Loaded {len(rows)} collected runs.")

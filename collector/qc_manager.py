@@ -5,7 +5,7 @@ REPO_ROOT=Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:sys.path.insert(0,str(REPO_ROOT))
 
 def read(path): return list(csv.DictReader(path.open(encoding='utf-8-sig'))) if path.exists() else []
-QC_FIELDS=['record_id','run_index','video','cell','analysis','pipeline_status','qc_decision','track_preview','track_pdf','run_dir','notes','collected_at']
+QC_FIELDS=['record_id','run_index','video','cell','analysis','pipeline_status','qc_decision','track_preview','track_pdf','run_dir','notes','date_run','collected_at']
 
 def normalize_qc_row(raw):
  row={key:'' for key in QC_FIELDS}
@@ -14,6 +14,13 @@ def normalize_qc_row(raw):
  row['pipeline_status']=row['pipeline_status'] or raw.get('status','') or raw.get('post','')
  row['qc_decision']=row['qc_decision'] or raw.get('qc','') or 'PENDING'
  row['track_preview']=row['track_preview'] or raw.get('track_map','')
+ if not row['date_run']:
+  row['date_run']=raw.get('run_timestamp','') or raw.get('collected_at','')
+  if not row['date_run']:
+   rid=row.get('record_id','')
+   stamp=rid.rsplit('_',1)[-1] if '_' in rid else ''
+   if len(stamp)==15 and stamp[8]=='T' and stamp.replace('T','').isdigit():
+    row['date_run']=f'{stamp[0:4]}-{stamp[4:6]}-{stamp[6:8]} {stamp[9:11]}:{stamp[11:13]}:{stamp[13:15]}'
  return row
 
 def write(path,rows,fields):
