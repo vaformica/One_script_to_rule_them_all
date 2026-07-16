@@ -167,3 +167,8 @@
 - Added fight-only interaction-location track maps with contact stars.
 - Added an experimental fight-only 3D X/Y/time track page.
 - Preserved the full analysis-generated fight PDF through QC collection and downloads.
+
+## 0.9.10
+- Fixed successful IDtracker runs being marked failed when IDtracker ignored the TOML filename and created a video-based session name with a numeric suffix.
+- Session discovery now follows the proven fight-batch pattern of locating an actual complete session tree.
+- Parallel same-video jobs are distinguished using the video path, ROI polygon, complete trajectory files, and the job start marker.

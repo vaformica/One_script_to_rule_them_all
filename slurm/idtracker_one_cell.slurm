@@ -14,6 +14,7 @@ set -uo pipefail
 
 mkdir -p "$PIPELINE_RUN_DIR/logs" "$PIPELINE_RUN_DIR/status"
 printf 'Running IDtracker\n' > "$PIPELINE_RUN_DIR/status/stage.txt"
+touch "$PIPELINE_RUN_DIR/status/idtracker_started.marker"
 
 source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate "${IDTRACKER_CONDA_ENV:-idtrackerai}"
@@ -26,7 +27,8 @@ printf '%s\n' "$IDTRACKER_RC" > "$PIPELINE_RUN_DIR/status/idtracker_exit_code.tx
 
 printf 'Locating Session\n' > "$PIPELINE_RUN_DIR/status/stage.txt"
 if SESSION_PATH="$(python "$PIPELINE_REPO_ROOT/pipeline/session_locator.py" \
-    --toml "$PIPELINE_TOML" --run-dir "$PIPELINE_RUN_DIR" 2>"$PIPELINE_RUN_DIR/logs/session_locator.err")"; then
+    --toml "$PIPELINE_TOML" --run-dir "$PIPELINE_RUN_DIR" \
+    --newer-than-file "$PIPELINE_RUN_DIR/status/idtracker_started.marker" 2>"$PIPELINE_RUN_DIR/logs/session_locator.err")"; then
     printf '%s\n' "$SESSION_PATH" > "$PIPELINE_RUN_DIR/session_link.txt"
     printf '%s\n' "$SESSION_PATH" > "$PIPELINE_RUN_DIR/session_path.txt"
 else
