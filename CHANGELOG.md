@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.7.2
+
+- Fixed headless SLURM execution by adding the required `--track` flag.
+- Prevented IDtracker from launching the segmentation GUI on compute nodes.
+- Made the Firebird installer quick by default and reusable across code updates.
+- Added `scripts/firebird/quick_install.sh`, which never modifies Conda environments.
+- Added explicit `--update-env` mode for dependency changes.
+
+
+## 0.7.1
+
+- Fixed IDtracker.ai 6.0.10 rejection of mixed integer/float threshold pairs.
+- Threshold pairs are normalized to one TOML numeric type before writing.
+- Mac and Firebird validators now reject `[25.0, 255]`-style arrays.
+- Background continues to edit the minimum intensity threshold only.
+
+
 ## 0.7.0
 
 - Added persistent Mac-side SQLite indexing for Firebird scans.

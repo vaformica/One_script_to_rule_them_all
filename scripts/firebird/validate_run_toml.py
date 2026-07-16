@@ -30,6 +30,15 @@ def validate_array(value, path):
     if all(numeric):
         if len(value) != 2:
             raise ValueError(f"{path} must be [minimum, maximum]")
+        numeric_types = {type(item) for item in value}
+        if len(numeric_types) != 1:
+            rendered_types = ", ".join(
+                sorted(item_type.__name__ for item_type in numeric_types)
+            )
+            raise ValueError(
+                f"{path} mixes numeric TOML types ({rendered_types}); "
+                "IDtracker.ai 6.0.10 requires homogeneous arrays"
+            )
         if value[0] > value[1]:
             raise ValueError(
                 f"{path} minimum {value[0]} exceeds maximum {value[1]}"

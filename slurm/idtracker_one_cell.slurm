@@ -18,9 +18,13 @@ conda activate "${IDTRACKER_CONDA_ENV:-idtrackerai}"
 mkdir -p "$PIPELINE_RUN_DIR/logs" "$PIPELINE_SESSION_OUTPUT_DIR"
 cd "$PIPELINE_SESSION_OUTPUT_DIR"
 
-# IDtracker.ai 6.x invocation. This deliberately omits the obsolete
-# 'terminal_mode' positional argument.
-idtrackerai --load "$PIPELINE_TOML"
+# IDtracker.ai 6.x headless invocation.
+#
+# --load reads the TOML.
+# --track bypasses the segmentation GUI and starts tracking directly.
+# Without --track, IDtracker tries to launch Qt, which fails on a headless
+# SLURM compute node with "could not connect to display".
+idtrackerai --track --load "$PIPELINE_TOML"
 
 # Find the newest session directory produced by this job.
 SESSION_PATH="$(

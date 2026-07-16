@@ -89,15 +89,59 @@ def _find_first_pair(value):
     return None
 
 
+def _coerce_homogeneous_numeric_pair(pair):
+    """
+    IDtracker.ai 6.0.10 uses the older `toml` parser, which requires every
+    numeric element in an array to use the same TOML type. For example,
+    [25.0, 255] is rejected even though both values are numeric.
+    """
+    if len(pair) != 2 or not all(_is_number(x) for x in pair):
+        return
+
+    if any(isinstance(x, float) for x in pair):
+        pair[0] = float(pair[0])
+        pair[1] = float(pair[1])
+    else:
+        pair[0] = int(pair[0])
+        pair[1] = int(pair[1])
+
+
 def _update_threshold_pairs(value, minimum=None, maximum=None):
     if not isinstance(value, list):
         return 0
+
     if len(value) == 2 and all(_is_number(x) for x in value):
+        original_was_float = any(isinstance(x, float) for x in value)
+
         if minimum is not None:
             value[0] = minimum
         if maximum is not None:
             value[1] = maximum
+
+        requires_float = (
+            original_was_float
+            or any(
+                isinstance(x, float) and math.isinf(x)
+                for x in value
+            )
+            or any(
+                isinstance(x, float)
+                and not math.isinf(x)
+                and not float(x).is_integer()
+                for x in value
+            )
+        )
+
+        if requires_float:
+            value[0] = float(value[0])
+            value[1] = float(value[1])
+        else:
+            value[0] = int(value[0])
+            value[1] = int(value[1])
+
+        _coerce_homogeneous_numeric_pair(value)
         return 1
+
     updated = 0
     for item in value:
         updated += _update_threshold_pairs(
@@ -121,6 +165,15 @@ def _validate_threshold_array(value, path):
     if all(numeric):
         if len(value) != 2:
             raise ValueError(f"{path} must be [minimum, maximum]")
+        numeric_types = {type(item) for item in value}
+        if len(numeric_types) != 1:
+            rendered_types = ", ".join(
+                sorted(item_type.__name__ for item_type in numeric_types)
+            )
+            raise ValueError(
+                f"{path} mixes numeric TOML types ({rendered_types}); "
+                "IDtracker.ai 6.0.10 requires homogeneous arrays"
+            )
         if value[0] > value[1]:
             raise ValueError(
                 f"{path} minimum {value[0]} exceeds maximum {value[1]}"
