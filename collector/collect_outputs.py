@@ -108,7 +108,16 @@ def collect(run_dir,project_root,metadata):
  else: status='FAIL';notes.append('track map missing')
  if metadata.analysis_type=='fight' and pngs:
   fight_pdf=pdfs/f'{rid}_tracks.pdf'
-  if pdf_from_pngs(pngs,fight_pdf):
+  # Prefer the analysis-generated PDF because it contains the combined map,
+  # individual maps, interaction-location map, and optional 3D time map.
+  generated_pdfs=sorted(
+   p for p in outputs.rglob('*_tracks.pdf')
+   if 'QC_review_bundle' not in p.parts and p.name != f'{rid}_tracks.pdf'
+  )
+  if generated_pdfs:
+   shutil.copy2(generated_pdfs[0],fight_pdf)
+   pdf_rel=f'fight_track_pdfs/{fight_pdf.name}';shutil.copy2(fight_pdf,outputs/f'{rid}_tracks.pdf')
+  elif pdf_from_pngs(pngs,fight_pdf):
    pdf_rel=f'fight_track_pdfs/{fight_pdf.name}';shutil.copy2(fight_pdf,outputs/f'{rid}_tracks.pdf')
  elif metadata.analysis_type=='ba':
   ba_dir=qc/'ba_track_pngs'/rid;ba_dir.mkdir(parents=True,exist_ok=True)

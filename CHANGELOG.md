@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.8
+- Refined the fight-only 3-D space-time track page to use an idTracker-style corner view.
+- Retained orange/blue animal identity colors along the complete 3-D trajectories.
+- Added ROI outlines on the z=0 floor, colored start/end markers, and timed interaction stars.
+- Broke 3-D paths across missing data and implausible jumps.
+- Preserved v0.9.7 as the confirmed rollback/source baseline.
+
 ## v0.9.6
 
 - Corrected fight left/right classification to represent each beetle's **starting side**.
@@ -153,3 +160,10 @@
 
 ## 0.9.4
 - Added QC lifecycle statuses, automatic superseding, replacement provenance, and text/status filtering.
+
+## 0.9.7
+
+- Fixed starting-side detection when early analyzed frames are NaN by using the first N valid tracked positions.
+- Added fight-only interaction-location track maps with contact stars.
+- Added an experimental fight-only 3D X/Y/time track page.
+- Preserved the full analysis-generated fight PDF through QC collection and downloads.

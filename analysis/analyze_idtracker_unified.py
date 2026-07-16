@@ -848,6 +848,7 @@ def plot_tracks(
     path_png: Path,
     path_pdf: Path,
     args: argparse.Namespace,
+    interaction_mask: Optional[np.ndarray] = None,
 ) -> None:
     """Make one standardized BA-style QC map stream for BA and fight tracks.
 
@@ -988,6 +989,145 @@ def plot_tracks(
                     h2.append(h); l2.append(lab); seen.add(lab)
             ax.legend(h2, l2, frameon=False, fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=2)
 
+    def draw_interaction_map(ax):
+        draw_one(ax, list(range(len(xys))), "Fight interactions: contact locations")
+        if interaction_mask is None or len(xys) < 2:
+            return
+        n = min(len(xys[0]), len(xys[1]), len(interaction_mask))
+        mask = np.asarray(interaction_mask[:n], dtype=bool)
+        xy0 = localize(xys[0][:n])
+        xy1 = localize(xys[1][:n])
+        valid = mask & np.isfinite(xy0).all(axis=1) & np.isfinite(xy1).all(axis=1)
+        idx = np.where(valid)[0]
+        max_pts = int(getattr(args, "map_max_interaction_points", 600))
+        if max_pts > 0 and len(idx) > max_pts:
+            idx = idx[np.linspace(0, len(idx) - 1, max_pts).astype(int)]
+        if len(idx):
+            mid = (xy0[idx] + xy1[idx]) / 2.0
+            ax.scatter(mid[:, 0], mid[:, 1], s=18, marker="*", color="crimson",
+                       edgecolor="black", linewidth=0.20, alpha=0.80,
+                       label="contact location", zorder=10)
+            handles, labels = ax.get_legend_handles_labels()
+            seen = set(); h2=[]; l2=[]
+            for h, lab in zip(handles, labels):
+                if lab not in seen:
+                    h2.append(h); l2.append(lab); seen.add(lab)
+            ax.legend(h2, l2, frameon=False, fontsize=8, loc="upper center",
+                      bbox_to_anchor=(0.5, -0.12), ncol=2)
+
+    def draw_interaction_3d(fig):
+        """Draw an idTracker-style corner view of x-y movement through time.
+
+        The animal identity colors are retained throughout the entire trajectory.
+        The arena footprint is drawn on the z=0 floor, while time rises vertically.
+        This makes the plot read like the classic idTracker space-time view rather
+        than a flat x-y chart with a third axis added afterward.
+        """
+        ax = fig.add_subplot(111, projection="3d")
+        colors = [args.animal0_color, args.animal1_color]
+        fps = float(args.fps) if args.fps else 1.0
+
+        # Draw the arena/ROI footprint on the floor of the 3-D plot.
+        for r_i, roi in enumerate(rois):
+            rp = localize(roi.poly)
+            closed = np.vstack([rp, rp[0]])
+            floor_z = np.zeros(len(closed), dtype=float)
+            if r_i == 0:
+                ax.plot(closed[:, 0], closed[:, 1], floor_z,
+                        linewidth=1.4, color="C2", alpha=0.95,
+                        label="primary ROI (floor)")
+            elif r_i == 1:
+                ax.plot(closed[:, 0], closed[:, 1], floor_z,
+                        linewidth=1.0, linestyle="--", color="C4", alpha=0.85,
+                        label="secondary ROI (floor)")
+
+        # Plot each animal as segmented colored paths so NaNs and large jumps do
+        # not create misleading straight lines through the 3-D volume.
+        for i in range(min(2, len(xys))):
+            xy = localize(xys[i])
+            t = np.arange(len(xy), dtype=float) / fps
+            finite = np.isfinite(xy).all(axis=1)
+            d = np.sqrt(np.sum(np.diff(xy, axis=0) ** 2, axis=1)) if len(xy) > 1 else np.array([])
+            breaks = np.zeros(len(xy), dtype=bool)
+            if len(xy):
+                breaks[0] = True
+                breaks[~finite] = True
+                if len(d) and args.max_step_px and args.max_step_px > 0:
+                    breaks[np.r_[False, np.isfinite(d) & (d > float(args.max_step_px))]] = True
+
+            first_segment = True
+            start = None
+            for j in range(len(xy) + 1):
+                end_now = (j == len(xy)) or (j < len(xy) and breaks[j])
+                if end_now and start is not None:
+                    if j - start >= 2:
+                        ax.plot(
+                            xy[start:j, 0], xy[start:j, 1], t[start:j],
+                            linewidth=0.55, alpha=0.82, color=colors[i],
+                            label=f"animal_{i} track" if first_segment else None,
+                        )
+                        first_segment = False
+                    start = None
+                if j < len(xy) and finite[j] and start is None:
+                    start = j
+
+            if finite.any():
+                first = int(np.where(finite)[0][0])
+                last = int(np.where(finite)[0][-1])
+                ax.scatter(xy[first, 0], xy[first, 1], t[first], s=42, marker="o",
+                           color=colors[i], edgecolor="black", linewidth=0.35,
+                           label=f"animal_{i} start", depthshade=False)
+                ax.scatter(xy[last, 0], xy[last, 1], t[last], s=42, marker="s",
+                           color=colors[i], edgecolor="black", linewidth=0.35,
+                           label=f"animal_{i} end", depthshade=False)
+
+        if interaction_mask is not None and len(xys) >= 2:
+            n = min(len(xys[0]), len(xys[1]), len(interaction_mask))
+            xy0 = localize(xys[0][:n]); xy1 = localize(xys[1][:n])
+            mask = np.asarray(interaction_mask[:n], dtype=bool)
+            valid = mask & np.isfinite(xy0).all(axis=1) & np.isfinite(xy1).all(axis=1)
+            idx = np.where(valid)[0]
+            max_pts = int(getattr(args, "map_max_interaction_points", 600))
+            if max_pts > 0 and len(idx) > max_pts:
+                idx = idx[np.linspace(0, len(idx) - 1, max_pts).astype(int)]
+            if len(idx):
+                mid = (xy0[idx] + xy1[idx]) / 2.0
+                ax.scatter(mid[:, 0], mid[:, 1], idx / fps, s=18, marker="*",
+                           color="crimson", edgecolor="black", linewidth=0.20,
+                           alpha=0.88, label="contact location", depthshade=False)
+
+        ax.set_xlabel(xlabel, labelpad=8)
+        ax.set_ylabel(ylabel, labelpad=8)
+        ax.set_zlabel("time from analysis start (s)", labelpad=8)
+        ax.set_title("Fight tracks through time (corner view)", pad=16)
+        ax.set_xlim(xmin, xmax)
+        ax.set_ylim(ymax, ymin)  # Match the image-coordinate orientation of 2-D maps.
+        max_len = max((len(xy) for xy in xys[:2]), default=1)
+        ax.set_zlim(0, max(1.0, (max_len - 1) / fps))
+
+        # Tall box and oblique corner view closely mimic the classic idTracker plot.
+        try:
+            ax.set_box_aspect((1.0, 1.0, 1.45))
+        except Exception:
+            pass
+        try:
+            ax.set_proj_type("persp", focal_length=0.9)
+        except Exception:
+            pass
+        ax.view_init(elev=28, azim=-52)
+        ax.grid(True, alpha=0.25)
+        for pane in (ax.xaxis.pane, ax.yaxis.pane, ax.zaxis.pane):
+            pane.set_alpha(0.08)
+
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            seen = set(); h2 = []; l2 = []
+            for h, lab in zip(handles, labels):
+                if lab and lab not in seen:
+                    h2.append(h); l2.append(lab); seen.add(lab)
+            ax.legend(h2, l2, frameon=False, fontsize=8, loc="upper left",
+                      bbox_to_anchor=(0.0, 1.0))
+
     def finalize_figure(fig):
         run_name = str(getattr(args, "map_run_name", "") or "").strip()
         if run_name:
@@ -1014,6 +1154,21 @@ def plot_tracks(
         fig.savefig(indiv_png, dpi=200)
         plt.close(fig)
 
+    if interaction_mask is not None and len(xys) >= 2:
+        interaction_png = path_png.with_name(f"{path_png.stem}_interactions{path_png.suffix}")
+        fig, ax = plt.subplots(figsize=(8, 8))
+        draw_interaction_map(ax)
+        finalize_figure(fig)
+        fig.savefig(interaction_png, dpi=200)
+        plt.close(fig)
+
+        interaction_3d_png = path_png.with_name(f"{path_png.stem}_interactions_3d{path_png.suffix}")
+        fig = plt.figure(figsize=(9, 8))
+        draw_interaction_3d(fig)
+        finalize_figure(fig)
+        fig.savefig(interaction_3d_png, dpi=200)
+        plt.close(fig)
+
     with PdfPages(path_pdf) as pdf:
         fig, ax = plt.subplots(figsize=(8, 8))
         draw_one(ax, list(range(len(xys))), ("Behavioral assay track" if len(xys) == 1 else "Fight tracks: both beetles"))
@@ -1023,7 +1178,18 @@ def plot_tracks(
         for i in range(len(xys)):
             fig, ax = plt.subplots(figsize=(8, 8))
             draw_one(ax, [i], ((f"Behavioral assay track: animal_{i}") if len(xys) == 1 else f"Fight track: animal_{i}"))
-            fig.tight_layout(rect=[0, 0.10, 1, 1])
+            finalize_figure(fig)
+            pdf.savefig(fig)
+            plt.close(fig)
+        if interaction_mask is not None and len(xys) >= 2:
+            fig, ax = plt.subplots(figsize=(8, 8))
+            draw_interaction_map(ax)
+            finalize_figure(fig)
+            pdf.savefig(fig)
+            plt.close(fig)
+            fig = plt.figure(figsize=(9, 8))
+            draw_interaction_3d(fig)
+            finalize_figure(fig)
             pdf.savefig(fig)
             plt.close(fig)
 
@@ -1249,13 +1415,24 @@ def process_session(args: argparse.Namespace) -> Tuple[Path, Optional[Path]]:
     starting_position_frames = max(1, int(args.starting_position_frames))
     if analysis_type == "fight" and len(xys) >= 2:
         for position, xy in enumerate(xys[:2]):
-            initial_x = np.asarray(xy[:starting_position_frames, 0], dtype=float)
-            valid_initial_x = initial_x[np.isfinite(initial_x)]
+            # Use the first N VALID positions after the analysis begins, rather
+            # than requiring valid data inside the first N absolute frames.
+            # IDtracker sessions often contain leading NaNs before the animal
+            # receives a valid identity, even though the plotted start marker is
+            # clear later.  This mirrors the visible start marker on the QC map.
+            all_x = np.asarray(xy[:, 0], dtype=float)
+            valid_idx = np.flatnonzero(np.isfinite(all_x))
+            selected_idx = valid_idx[:starting_position_frames]
+            valid_initial_x = all_x[selected_idx]
             starting_x_by_position[position] = (
                 float(np.median(valid_initial_x))
                 if len(valid_initial_x)
                 else float("nan")
             )
+            summaries[position]["starting_position_first_valid_frame_local"] = (
+                int(selected_idx[0]) if len(selected_idx) else np.nan
+            )
+            summaries[position]["starting_position_valid_frames_used"] = int(len(selected_idx))
         x0 = starting_x_by_position[0]
         x1 = starting_x_by_position[1]
         if np.isfinite(x0) and np.isfinite(x1):
@@ -1269,6 +1446,13 @@ def process_session(args: argparse.Namespace) -> Tuple[Path, Optional[Path]]:
             summary["starting_side"] = starting_side_by_position[position]
             summary["starting_x_position_px"] = starting_x_by_position[position]
             summary["starting_position_window_frames"] = starting_position_frames
+
+    pair_result = None
+    interaction_mask = None
+    if analysis_type == "fight":
+        pair_result = pairwise_metrics(xys[0], xys[1], start_frame, rois, args)
+        pair_frame_for_plot = pair_result[1]
+        interaction_mask = pair_frame_for_plot["contact_le_threshold_px"].to_numpy(dtype=bool)
 
     png_path = output_dir / f"{prefix}_track_map.png"
     pdf_path = output_dir / f"{prefix}_tracks.pdf"
@@ -1286,6 +1470,7 @@ def process_session(args: argparse.Namespace) -> Tuple[Path, Optional[Path]]:
         png_path,
         pdf_path,
         args,
+        interaction_mask=interaction_mask,
     )
 
     individual_summary_path = output_dir / (
@@ -1324,9 +1509,8 @@ def process_session(args: argparse.Namespace) -> Tuple[Path, Optional[Path]]:
         print(f"  individual summary: {individual_summary_path}")
         return individual_summary_path, None
 
-    pair_summary, pair_frame, events_df, fight_df = pairwise_metrics(
-        xys[0], xys[1], start_frame, rois, args
-    )
+    assert pair_result is not None
+    pair_summary, pair_frame, events_df, fight_df = pair_result
     pair_summary.update(flat_session)
     pair_summary["analysis_type"] = analysis_type
     pair_summary["animal0_index_0_based"] = animal_indices[0]
@@ -1334,6 +1518,10 @@ def process_session(args: argparse.Namespace) -> Tuple[Path, Optional[Path]]:
     pair_summary["animal0_starting_x_position_px"] = starting_x_by_position.get(0, np.nan)
     pair_summary["animal1_starting_x_position_px"] = starting_x_by_position.get(1, np.nan)
     pair_summary["starting_position_window_frames"] = starting_position_frames
+    pair_summary["starting_position_valid_frames_used_animal0"] = summaries[0].get("starting_position_valid_frames_used", 0)
+    pair_summary["starting_position_valid_frames_used_animal1"] = summaries[1].get("starting_position_valid_frames_used", 0)
+    pair_summary["starting_position_first_valid_frame_local_animal0"] = summaries[0].get("starting_position_first_valid_frame_local", np.nan)
+    pair_summary["starting_position_first_valid_frame_local_animal1"] = summaries[1].get("starting_position_first_valid_frame_local", np.nan)
     pair_summary["left_starting_animal_index_0_based"] = (
         animal_indices[0] if starting_side_by_position.get(0) == "left"
         else animal_indices[1] if starting_side_by_position.get(1) == "left"
@@ -1411,7 +1599,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--move-threshold-px", type=float, default=30.0, help="Displacement threshold for movement onset.")
     p.add_argument("--movement-onset-consecutive-frames", type=int, default=30, help="Consecutive frames needed for sustained movement onset.")
-    p.add_argument("--starting-position-frames", type=int, default=30, help="Fight only: classify starting left/right side from the median valid X coordinate in the first N analyzed frames (default: 30).")
+    p.add_argument("--starting-position-frames", type=int, default=30, help="Fight only: classify starting left/right side from the median X coordinate of the first N valid tracked positions after analysis begins (default: 30).")
     p.add_argument("--max-step-px", type=float, default=50.0, help="Large frame-to-frame jump threshold for artifact interpolation.")
     p.add_argument("--interpolation-warning-fraction", type=float, default=0.05, help="Interpolated-frame fraction that triggers QC warning.")
     p.add_argument("--interpolation-warning-frames", type=int, default=300, help="Interpolated-frame count that triggers QC warning.")
@@ -1429,6 +1617,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--show-map-points", action="store_true", help="Add dense trajectory points to maps.")
     p.add_argument("--full-frame-map", action="store_true", help="Use observed full track extent rather than first ROI crop.")
     p.add_argument("--map-max-overlay-points", type=int, default=400, help="Maximum interpolated or turtling marker points drawn per animal on QC maps. Counts in CSV outputs are not capped.")
+    p.add_argument("--map-max-interaction-points", type=int, default=600, help="Fight only: maximum contact-location stars shown on interaction maps. Event calculations are not capped.")
 
     p.add_argument("--disable-turtling", action="store_true", help="Disable centroid-based turtling-like detector.")
     p.add_argument("--turtling-window-frames", type=int, default=300)
