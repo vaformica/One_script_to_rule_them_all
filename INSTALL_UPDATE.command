@@ -68,6 +68,9 @@ PYTHONPATH="$ROOT" "$PY" "$ROOT/processors/run_unified_pipeline.py" --help >/dev
 PYTHONPATH="$ROOT" "$PY" "$ROOT/collector/collect_outputs.py" --help >/dev/null
 PYTHONPATH="$ROOT" "$PY" "$ROOT/collector/qc_manager.py" --help >/dev/null
 test -x "$ROOT/scripts/firebird/set_qc_status.sh"
+grep -q 'QC_review_bundle' "$ROOT/collector/collect_outputs.py"
+grep -q 'view_selected_qc_files' "$ROOT/app/mac_gui.py"
+grep -q "'window_frames','Window frames',7500" "$ROOT/app/mac_gui.py"
 
 # Normalize any QC index created by an earlier pipeline release.
 PYTHONPATH="$ROOT" "$PY" "$ROOT/collector/qc_manager.py" --project-root /data/labs/vformic1-swat-lab/idtracker_pipeline_runs --migrate-index

@@ -4,7 +4,7 @@ Analyze one-animal idtracker.ai trajectories for beetle behavioral assay videos.
 
 What it computes by default
 ---------------------------
-- Total distance traveled over a fixed analysis window, default 7200 frames.
+- Total distance traveled over a fixed analysis window, default 7500 frames.
 - Speed and acceleration summaries in pixels/frame only. Body-length and seconds-based outputs are intentionally excluded.
 - Movement latency: frames from analysis_start_frame until the beetle is at least N pixels from its starting position.
 - Cumulative movement latency: frames from analysis_start_frame until cumulative path length reaches N pixels.
@@ -16,7 +16,7 @@ Typical use
 python analyze_idtracker_beetle.py \
   --input-dir /path/to/idtracker/session_or_outputs \
   --analysis-start-frame 1540 \
-  --window-frames 7200 \
+  --window-frames 7500 \
   --move-threshold-px 30 \
   --output-dir beetle_analysis
 
@@ -864,7 +864,7 @@ def main() -> None:
     parser.add_argument("--attributes-json", type=Path, default=None, help="Path to attributes.json.")
     parser.add_argument("--animal-index", type=int, default=0, help="0-based animal index. For one beetle, keep 0.")
     parser.add_argument("--analysis-start-frame", type=int, default=1540, help="Global video frame where behavioral analysis starts.")
-    parser.add_argument("--window-frames", type=int, default=7200, help="Number of frames to analyze from analysis start.")
+    parser.add_argument("--window-frames", type=int, default=7500, help="Number of frames to analyze from analysis start.")
     parser.add_argument("--move-threshold-px", type=float, default=30.0, help="Pixel displacement threshold for movement latency.")
     parser.add_argument("--movement-onset-consecutive-frames", type=int, default=30,
                         help="Require displacement to stay above --move-threshold-px for this many consecutive frames before scoring sustained movement onset. Default: 30 frames.")

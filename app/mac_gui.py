@@ -648,7 +648,7 @@ class Window(QMainWindow):
         archive_note=QLabel('IDtracker sessions remain in their canonical video-folder location. Copying or moving sessions is deferred and never performed during a run.'); archive_note.setWordWrap(True); layout.addWidget(archive_note)
         self.param={}
         specs={
-          'Fight':[('analysis_stop_frame','Analysis stop frame',0,0,100000000,1),('contact_px','Contact distance (px)',60,0,10000,.1),('fight_px','Fight distance (px)',35,0,10000,.1),('min_fight_frames','Minimum fight duration (frames)',6,1,100000,1),('roi_wall_buffer_px','Wall buffer (px)',30,0,10000,.1),('window_frames','Window frames',7200,1,100000000,1)],
+          'Fight':[('analysis_stop_frame','Analysis stop frame',0,0,100000000,1),('contact_px','Contact distance (px)',60,0,10000,.1),('fight_px','Fight distance (px)',35,0,10000,.1),('min_fight_frames','Minimum fight duration (frames)',6,1,100000,1),('roi_wall_buffer_px','Wall buffer (px)',30,0,10000,.1),('window_frames','Window frames',7500,1,100000000,1)],
           'BA':[('ba_analysis_stop_frame','Analysis stop frame',0,0,100000000,1),('ba_roi_wall_buffer_px','Wall buffer (px)',30,0,10000,.1),('move_threshold_px','Movement threshold (px)',30,0,10000,.1),('movement_onset_consecutive_frames','Movement onset duration (frames)',30,1,100000,1),('turtling_window_frames','Turtle window (frames)',300,1,100000,1),('turtling_min_duration_frames','Turtle minimum duration (frames)',300,1,100000,1)]}
         tips={'analysis_stop_frame':'0 means use Window frames','ba_analysis_stop_frame':'0 means use all configured frames','contact_px':'Distance defining contact','fight_px':'Stricter fight-distance threshold','roi_wall_buffer_px':'Inward ROI border width','ba_roi_wall_buffer_px':'Inward ROI border width'}
         for title,rows in specs.items():
@@ -748,7 +748,7 @@ class Window(QMainWindow):
         note=QLabel("Review completed runs. DONE adds that run to the appropriate master individual-summary spreadsheet; RERUN excludes it. Fight tracks download as one PDF per fight. BA tracks remain PNG files.");note.setWordWrap(True);layout.addWidget(note)
         self.qc_table=QTableWidget(0,7);self.qc_table.setHorizontalHeaderLabels(["Record ID","Analysis","Video","Cell","Pipeline","QC decision","Run folder"]);self.qc_table.setSelectionBehavior(QAbstractItemView.SelectRows);self.qc_table.setSortingEnabled(True);self.qc_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents);self.qc_table.horizontalHeader().setSectionResizeMode(6,QHeaderView.Stretch);layout.addWidget(self.qc_table)
         row=QHBoxLayout()
-        for label,fn in [("Refresh QC",self.refresh_qc),("Mark DONE",lambda:self.set_qc_decision('DONE')),("Mark NEEDS RERUN",lambda:self.set_qc_decision('RERUN')),("Mark Pending",lambda:self.set_qc_decision('PENDING')),("Download Selected",self.download_selected_qc),("Download Master Spreadsheets",self.download_master_spreadsheets)]:
+        for label,fn in [("Refresh QC",self.refresh_qc),("Mark DONE",lambda:self.set_qc_decision('DONE')),("Mark NEEDS RERUN",lambda:self.set_qc_decision('RERUN')),("Mark Pending",lambda:self.set_qc_decision('PENDING')),("Download Selected",self.download_selected_qc),("View Files",self.view_selected_qc_files),("Download Master Spreadsheets",self.download_master_spreadsheets)]:
             b=QPushButton(label);b.clicked.connect(fn);row.addWidget(b)
         layout.addLayout(row);self.qc_message=QLabel('');self.qc_message.setWordWrap(True);layout.addWidget(self.qc_message);return page
 
@@ -791,12 +791,33 @@ class Window(QMainWindow):
             dest=self._download_remote(job['run_dir']+'/outputs',f"{Path(job['run_dir']).name}_outputs");QMessageBox.information(self,'Download complete',f'Results downloaded to:\n{dest}')
         except Exception as exc:QMessageBox.critical(self,'Download failed',str(exc))
 
+    def _download_qc_bundle(self,rec):
+        # The collector creates one flat folder containing only the files needed
+        # for QC: individual summaries plus fight PDF or BA track PNGs.
+        remote=rec['run_dir'].rstrip('/')+'/outputs/QC_review_bundle'
+        try:
+            return self._download_remote(remote,rec['record_id'])
+        except Exception:
+            # Backward-compatible fallback for runs collected before v0.9.2.
+            return self._download_remote(rec['run_dir'].rstrip('/')+'/outputs',rec['record_id'])
+
     def download_selected_qc(self):
         rec=self.selected_qc()
         if not rec:return
         try:
-            dest=self._download_remote(rec['run_dir']+'/outputs',rec['record_id']);QMessageBox.information(self,'Download complete',f'Results downloaded to:\n{dest}')
+            dest=self._download_qc_bundle(rec);QMessageBox.information(self,'Download complete',f'QC files downloaded to one folder:\n{dest}')
         except Exception as exc:QMessageBox.critical(self,'Download failed',str(exc))
+
+    def view_selected_qc_files(self):
+        rec=self.selected_qc()
+        if not rec:return
+        try:
+            dest=self._download_qc_bundle(rec)
+            subprocess.run(['open',str(dest)],check=True)
+            pdfs=sorted(dest.glob('*_tracks.pdf'))
+            if pdfs: subprocess.run(['open',str(pdfs[0])],check=False)
+            self.qc_message.setText(f'Opened QC files for {rec["record_id"]}: {dest}')
+        except Exception as exc:QMessageBox.critical(self,'View files failed',str(exc))
 
     def download_master_spreadsheets(self):
         try:

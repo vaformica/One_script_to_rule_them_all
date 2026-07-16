@@ -270,7 +270,7 @@ def parser():
         default="auto",
     )
     p.add_argument("--analysis-start-frame", type=int, default=0)
-    p.add_argument("--window-frames", type=int, default=7200)
+    p.add_argument("--window-frames", type=int, default=7500)
     p.add_argument("--fps", type=float, default=30.0)
     p.add_argument("--animal0", type=int, default=0)
     p.add_argument("--animal1", type=int, default=1)

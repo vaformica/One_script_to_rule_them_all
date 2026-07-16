@@ -12,7 +12,7 @@ Example:
         --analysis-script /path/to/analyze_idtracker_beetle.py \
         --output-root /data/labs/vformic1-swat-lab/2026_Videos/2026_BA/postprocessing \
         --analysis-start-frame 1540 \
-        --window-frames 7200 \
+        --window-frames 7500 \
         --move-threshold-px 30
 """
 
@@ -264,7 +264,7 @@ def parse_args() -> argparse.Namespace:
 
     # Core behavior-analysis settings.
     p.add_argument("--analysis-start-frame", type=int, default=1540)
-    p.add_argument("--window-frames", type=int, default=7200)
+    p.add_argument("--window-frames", type=int, default=7500)
     p.add_argument("--move-threshold-px", type=float, default=30.0)
     p.add_argument("--movement-onset-consecutive-frames", type=int, default=30,
                    help="Require displacement to remain above the movement threshold for this many consecutive frames before scoring sustained onset.")

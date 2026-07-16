@@ -96,7 +96,7 @@ python analysis/run_idtracker_unified_batch.py \
   --search-root /path/to/session_or_parent \
   --output-root /path/to/output \
   --analysis-type auto \
-  --window-frames 7200 \
+  --window-frames 7500 \
   --overwrite
 ```
 

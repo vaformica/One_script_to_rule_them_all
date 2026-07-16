@@ -120,3 +120,11 @@
 - Preserves prior QC decisions when possible.
 - Writes the QC index atomically to avoid partial files.
 - Prevents legacy columns such as `tracking`, `post`, `archive`, `status`, `qc`, and `track_map` from crashing collection.
+
+## 0.9.2
+- Added flat `QC_review_bundle` folders containing all individual-summary CSVs and QC track files.
+- Added **View Files** to the QC tab; it downloads and opens the selected bundle and fight PDF.
+- Fight QC now uses one deduplicated multipage PDF per fight.
+- BA QC continues to use PNG track maps.
+- Changed the default window length from 7200 to 7500 frames across active and legacy entry points.
+- Preserved v0.9.1 as the confirmed rollback/source baseline.

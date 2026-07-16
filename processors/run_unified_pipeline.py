@@ -24,7 +24,7 @@ def main():
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--run-metadata-json", required=True)
     parser.add_argument("--analysis-stop-frame", type=int, default=0)
-    parser.add_argument("--window-frames", type=int, default=7200)
+    parser.add_argument("--window-frames", type=int, default=7500)
     parser.add_argument("--fps", type=float, default=30.0)
     parser.add_argument("--contact-px", type=float, default=60.0)
     parser.add_argument("--min-contact-s", type=float, default=0.2)
