@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.0
+
+- Routed every SLURM stdout/stderr file into the corresponding run folder.
+- Added persistent `job_ids.env` to each run.
+- Added Firebird run-diagnostic command.
+- Added Mac Jobs and Diagnostics tab.
+- Added queue, accounting, dependency, session, and log queries.
+- Added guarded cancellation of permanently blocked dependent jobs.
+
+
 ## 0.5.0
 
 - Embedded the exact uploaded BA and fight source files.

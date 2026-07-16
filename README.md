@@ -166,3 +166,43 @@ against the archived uploaded scripts. See:
 ```text
 docs/UNIFIED_ANALYSIS_DESIGN.md
 ```
+
+
+## Run-specific logs
+
+Every stage now writes directly into its run folder:
+
+```text
+<run_dir>/logs/idtracker_<jobid>.out
+<run_dir>/logs/idtracker_<jobid>.err
+<run_dir>/logs/postprocess_<jobid>.out
+<run_dir>/logs/postprocess_<jobid>.err
+<run_dir>/logs/collector_<jobid>.out
+<run_dir>/logs/collector_<jobid>.err
+```
+
+The submission helper also writes:
+
+```text
+<run_dir>/job_ids.env
+```
+
+with the three SLURM job IDs.
+
+## Built-in GUI diagnostics
+
+The Mac application includes a **Jobs and Diagnostics** tab. For each submitted
+run it can retrieve:
+
+- current `squeue` state and pending reason
+- `sacct` history, state, elapsed time, and exit code
+- active dependency information
+- run metadata
+- recorded job IDs
+- session-folder discovery
+- trajectory and JSON files found in the session
+- the last 200–300 lines of all run logs
+- likely error messages collected from all logs
+
+It also provides a guarded button for cancelling post-processing and collector
+jobs that are permanently blocked by failed dependencies.

@@ -11,7 +11,8 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QPushButton, QLabel, QTabWidget, QTableWidget, QTableWidgetItem,
-    QHeaderView, QMessageBox, QFileDialog, QComboBox, QCheckBox
+    QHeaderView, QMessageBox, QFileDialog, QComboBox, QCheckBox, QTextEdit,
+    QAbstractItemView
 )
 import tomlkit
 
@@ -75,12 +76,14 @@ class Window(QMainWindow):
         super().__init__()
         self.cfg = load_config()
         self.rows = []
+        self.jobs = []
         self.setWindowTitle("Beetle IDtracker Unified Pipeline")
         self.resize(1500, 850)
         tabs = QTabWidget()
         tabs.addTab(self.connection_page(), "1. Connection")
         tabs.addTab(self.scan_page(), "2. Scan and Match")
         tabs.addTab(self.submit_page(), "3. Submit")
+        tabs.addTab(self.diagnostics_page(), "4. Jobs and Diagnostics")
         self.setCentralWidget(tabs)
 
     def connection_page(self):
@@ -141,6 +144,69 @@ class Window(QMainWindow):
         layout.addWidget(self.result)
         layout.addStretch()
         return page
+
+
+def diagnostics_page(self):
+    page = QWidget()
+    layout = QVBoxLayout(page)
+
+    explanation = QLabel(
+        "Select a submitted run, then retrieve SLURM state, accounting "
+        "history, dependencies, exit codes, run metadata, session discovery, "
+        "and the most recent stdout/stderr logs directly from Firebird."
+    )
+    explanation.setWordWrap(True)
+    layout.addWidget(explanation)
+
+    self.jobs_table = QTableWidget(0, 8)
+    self.jobs_table.setHorizontalHeaderLabels([
+        "Run", "Date/time", "Video/cell", "IDtracker job",
+        "Post-process job", "Collector job", "Status", "Remote run folder"
+    ])
+    self.jobs_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+    self.jobs_table.setAlternatingRowColors(True)
+    self.jobs_table.horizontalHeader().setSectionResizeMode(
+        QHeaderView.ResizeToContents
+    )
+    self.jobs_table.horizontalHeader().setSectionResizeMode(
+        7, QHeaderView.Stretch
+    )
+    self.jobs_table.itemSelectionChanged.connect(
+        self.retrieve_selected_diagnostics
+    )
+    layout.addWidget(self.jobs_table)
+
+    buttons = QHBoxLayout()
+
+    refresh_all = QPushButton("Refresh All Job States")
+    refresh_all.clicked.connect(self.refresh_all_job_states)
+    buttons.addWidget(refresh_all)
+
+    diagnose = QPushButton("Diagnose Selected Run")
+    diagnose.clicked.connect(self.retrieve_selected_diagnostics)
+    buttons.addWidget(diagnose)
+
+    logs = QPushButton("Fetch Selected Run Logs")
+    logs.clicked.connect(self.fetch_selected_logs)
+    buttons.addWidget(logs)
+
+    sessions = QPushButton("Check Session Discovery")
+    sessions.clicked.connect(self.check_selected_session)
+    buttons.addWidget(sessions)
+
+    cancel_blocked = QPushButton("Cancel Blocked Dependents")
+    cancel_blocked.clicked.connect(self.cancel_selected_blocked_jobs)
+    buttons.addWidget(cancel_blocked)
+
+    layout.addLayout(buttons)
+
+    self.diagnostics_output = QTextEdit()
+    self.diagnostics_output.setReadOnly(True)
+    self.diagnostics_output.setPlaceholderText(
+        "Diagnostics for the selected run will appear here."
+    )
+    layout.addWidget(self.diagnostics_output, 1)
+    return page
 
     def ssh(self):
         return SSH(self.host.text().strip(), self.key.text().strip())
@@ -318,10 +384,251 @@ class Window(QMainWindow):
                     f"bash {shlex.quote(self.repo_root.text().rstrip('/') + '/scripts/firebird/submit_pipeline_run.sh')}"
                 )
                 result = ssh.run(command)
+                job_ids = {
+                    "IDTRACKER_JOB": "",
+                    "POSTPROCESS_JOB": "",
+                    "COLLECTOR_JOB": "",
+                }
+                for output_line in result.splitlines():
+                    if "=" not in output_line:
+                        continue
+                    key, value = output_line.split("=", 1)
+                    if key in job_ids:
+                        job_ids[key] = value.strip()
+
+                self.jobs.append({
+                    "run_index": run_index,
+                    "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+                    "label": f"{Path(row['video']).name} / {row['cell']}",
+                    "idtracker_job": job_ids["IDTRACKER_JOB"],
+                    "postprocess_job": job_ids["POSTPROCESS_JOB"],
+                    "collector_job": job_ids["COLLECTOR_JOB"],
+                    "status": "Submitted",
+                    "run_dir": run_dir,
+                })
+                self.populate_jobs_table()
                 messages.append(f"Run {run_index:05d}: {result.strip()}")
             except Exception as exc:
                 messages.append(f"{row['toml']}: ERROR {exc}")
         self.result.setText("\n".join(messages) if messages else "No rows selected.")
+
+
+
+def populate_jobs_table(self):
+    if not hasattr(self, "jobs_table"):
+        return
+    self.jobs_table.setRowCount(len(self.jobs))
+    for row_number, job in enumerate(self.jobs):
+        values = [
+            f"{int(job['run_index']):05d}",
+            job["timestamp"],
+            job["label"],
+            job.get("idtracker_job", ""),
+            job.get("postprocess_job", ""),
+            job.get("collector_job", ""),
+            job.get("status", "Submitted"),
+            job["run_dir"],
+        ]
+        for column, value in enumerate(values):
+            item = QTableWidgetItem(str(value))
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            self.jobs_table.setItem(row_number, column, item)
+
+def selected_job(self):
+    if not hasattr(self, "jobs_table"):
+        return None
+    rows = self.jobs_table.selectionModel().selectedRows()
+    if not rows:
+        return None
+    index = rows[0].row()
+    if not 0 <= index < len(self.jobs):
+        return None
+    return self.jobs[index]
+
+def retrieve_selected_diagnostics(self):
+    job = self.selected_job()
+    if job is None:
+        return
+    try:
+        script = (
+            self.repo_root.text().rstrip("/")
+            + "/scripts/firebird/diagnose_pipeline_run.sh"
+        )
+        command = (
+            f"bash {shlex.quote(script)} "
+            f"{shlex.quote(job['run_dir'])}"
+        )
+        output = self.ssh().run(command, timeout=300)
+        self.diagnostics_output.setPlainText(output)
+    except Exception as exc:
+        self.diagnostics_output.setPlainText(
+            f"Could not retrieve diagnostics:\n{exc}"
+        )
+
+def fetch_selected_logs(self):
+    job = self.selected_job()
+    if job is None:
+        QMessageBox.warning(
+            self, "Select a run", "Select a run in the table first."
+        )
+        return
+    try:
+        run_dir = job["run_dir"]
+        command = (
+            f"if [[ -d {shlex.quote(run_dir + '/logs')} ]]; then "
+            f"for f in {shlex.quote(run_dir + '/logs')}/*.out "
+            f"{shlex.quote(run_dir + '/logs')}/*.err; do "
+            f"[[ -f \"$f\" ]] || continue; "
+            f"echo; echo \"===== $f =====\"; tail -n 300 \"$f\"; done; "
+            "else echo 'No logs directory exists.'; fi"
+        )
+        self.diagnostics_output.setPlainText(
+            self.ssh().run(command, timeout=300)
+        )
+    except Exception as exc:
+        QMessageBox.critical(self, "Log retrieval failed", str(exc))
+
+def check_selected_session(self):
+    job = self.selected_job()
+    if job is None:
+        QMessageBox.warning(
+            self, "Select a run", "Select a run in the table first."
+        )
+        return
+    try:
+        run_dir = job["run_dir"]
+        command = (
+            f"echo 'Run: {shlex.quote(run_dir)}'; "
+            f"if [[ -f {shlex.quote(run_dir + '/session_path.txt')} ]]; then "
+            f"echo 'Recorded session:'; "
+            f"cat {shlex.quote(run_dir + '/session_path.txt')}; "
+            f"session=$(cat {shlex.quote(run_dir + '/session_path.txt')}); "
+            f"echo; echo 'Session files:'; "
+            f"find \"$session\" -maxdepth 4 -type f "
+            r"\( -name 'trajectories*.npy' -o -name 'trajectories*.h5' "
+            r"-o -name 'session.json' -o -name 'attributes.json' \) "
+            r"-printf '%TY-%Tm-%Td %TH:%TM:%TS\t%p\n' 2>/dev/null | sort; "
+            f"else echo 'session_path.txt is missing'; fi; "
+            f"echo; echo 'All session_* directories under run:'; "
+            f"find {shlex.quote(run_dir)} -type d -name 'session_*' "
+            r"-printf '%TY-%Tm-%Td %TH:%TM:%TS\t%p\n' 2>/dev/null "
+            "| sort -r | head -30"
+        )
+        self.diagnostics_output.setPlainText(
+            self.ssh().run(command, timeout=300)
+        )
+    except Exception as exc:
+        QMessageBox.critical(
+            self, "Session check failed", str(exc)
+        )
+
+def refresh_all_job_states(self):
+    if not self.jobs:
+        QMessageBox.information(
+            self, "No jobs", "No runs have been submitted in this session."
+        )
+        return
+
+    for job in self.jobs:
+        ids = [
+            job.get("idtracker_job", ""),
+            job.get("postprocess_job", ""),
+            job.get("collector_job", ""),
+        ]
+        ids = [job_id for job_id in ids if job_id]
+        if not ids:
+            job["status"] = "No jobs"
+            continue
+
+        joined = ",".join(ids)
+        command = (
+            f"squeue -h -j {shlex.quote(joined)} -o '%i|%T|%R'; "
+            f"sacct -n -X -P -j {shlex.quote(joined)} "
+            "--format=JobIDRaw,State,ExitCode,Elapsed"
+        )
+        try:
+            output = self.ssh().run(command)
+            states = []
+            for line in output.splitlines():
+                if "|" not in line:
+                    continue
+                fields = line.split("|")
+                if len(fields) >= 2 and fields[0] in ids:
+                    states.append(
+                        f"{fields[0]}:{fields[1]}"
+                    )
+            job["status"] = ", ".join(dict.fromkeys(states)) or "Unknown"
+        except Exception as exc:
+            job["status"] = f"Error: {exc}"
+
+    self.populate_jobs_table()
+
+def cancel_selected_blocked_jobs(self):
+    job = self.selected_job()
+    if job is None:
+        QMessageBox.warning(
+            self, "Select a run", "Select a run in the table first."
+        )
+        return
+
+    candidates = [
+        job.get("postprocess_job", ""),
+        job.get("collector_job", ""),
+    ]
+    candidates = [job_id for job_id in candidates if job_id]
+    if not candidates:
+        QMessageBox.information(
+            self, "No dependent jobs", "No dependent job IDs are recorded."
+        )
+        return
+
+    joined = " ".join(shlex.quote(job_id) for job_id in candidates)
+    try:
+        states = self.ssh().run(
+            f"squeue -h -j {shlex.quote(','.join(candidates))} "
+            "-o '%i|%T|%R'"
+        )
+        blocked = []
+        for line in states.splitlines():
+            fields = line.split("|", 2)
+            if len(fields) != 3:
+                continue
+            job_id, state, reason = fields
+            if state == "PENDING" and (
+                "Dependency" in reason
+                or "DependencyNeverSatisfied" in reason
+            ):
+                blocked.append(job_id)
+
+        if not blocked:
+            QMessageBox.information(
+                self,
+                "No blocked jobs",
+                "No pending dependency-blocked jobs were found.",
+            )
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Cancel blocked jobs",
+            "Cancel these blocked dependent jobs?\n\n"
+            + "\n".join(blocked),
+        )
+        if answer == QMessageBox.Yes:
+            self.ssh().run(
+                "scancel "
+                + " ".join(shlex.quote(x) for x in blocked)
+            )
+            QMessageBox.information(
+                self,
+                "Cancelled",
+                "Cancelled: " + ", ".join(blocked),
+            )
+            self.refresh_all_job_states()
+    except Exception as exc:
+        QMessageBox.critical(
+            self, "Cancellation failed", str(exc)
+        )
 
 
 def main():

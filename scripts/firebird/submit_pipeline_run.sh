@@ -11,24 +11,41 @@ set -euo pipefail
 ID_SCRIPT="$PIPELINE_REPO_ROOT/slurm/idtracker_one_cell.slurm"
 PP_SCRIPT="$PIPELINE_REPO_ROOT/slurm/postprocess_one_cell.slurm"
 COLLECT_SCRIPT="$PIPELINE_REPO_ROOT/slurm/collect_one_cell.slurm"
+LOG_DIR="$PIPELINE_RUN_DIR/logs"
+
+mkdir -p "$LOG_DIR"
 
 ID_JOB="$(
   sbatch --parsable \
+    --output="$LOG_DIR/idtracker_%j.out" \
+    --error="$LOG_DIR/idtracker_%j.err" \
     --export=ALL \
     "$ID_SCRIPT"
 )"
+
 PP_JOB="$(
   sbatch --parsable \
     --dependency="afterok:${ID_JOB}" \
+    --output="$LOG_DIR/postprocess_%j.out" \
+    --error="$LOG_DIR/postprocess_%j.err" \
     --export=ALL \
     "$PP_SCRIPT"
 )"
+
 COLLECT_JOB="$(
   sbatch --parsable \
     --dependency="afterok:${PP_JOB}" \
+    --output="$LOG_DIR/collector_%j.out" \
+    --error="$LOG_DIR/collector_%j.err" \
     --export=ALL \
     "$COLLECT_SCRIPT"
 )"
+
+cat > "$PIPELINE_RUN_DIR/job_ids.env" <<EOF
+IDTRACKER_JOB=$ID_JOB
+POSTPROCESS_JOB=$PP_JOB
+COLLECTOR_JOB=$COLLECT_JOB
+EOF
 
 printf 'IDTRACKER_JOB=%s\nPOSTPROCESS_JOB=%s\nCOLLECTOR_JOB=%s\n' \
   "$ID_JOB" "$PP_JOB" "$COLLECT_JOB"
