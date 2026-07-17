@@ -1,3 +1,15 @@
+# Changelog
+
+## 0.9.23 - Failed Run Triage Report
+
+- Added a **Create Failed Run Triage Report** button to the Jobs and Diagnostics tab.
+- Scans recorded pipeline runs on Firebird in a background thread, preserving GUI responsiveness during unstable VPN connections.
+- Compares failed runs against later QC records marked **APPROVED** for the same video, cell, and analysis type.
+- Classifies each failed run as **Approved replacement exists**, **Rerun existing TOML**, **Consider new TOML**, or a conservative review category.
+- Uses failure-log evidence to distinguish likely transient/HPC failures from segmentation/TOML problems.
+- Writes both HTML and CSV reports to `~/Downloads/IDtracker_Results/Failed_Run_Reports/` and opens the HTML report automatically on macOS.
+- Includes source TOML paths, run folders, failure evidence, confidence level, approved replacement IDs, and suggested next actions.
+
 ## 0.9.22 - QC rerun comparison workflow
 
 - Added local rerun comparison mode for NEEDS RERUN and RERUNNING records.
@@ -264,3 +276,9 @@
 - Reworked submission preparation to batch-load selected TOMLs and reuse one SSH connection.
 - Disabled automatic retry for the final SLURM submission command to avoid duplicate jobs after an ambiguous disconnect.
 - Added clearer timeout errors directing users to Recover Runs from Firebird after connectivity returns.
+
+## v0.9.24
+- Search & Match now displays failed-attempt counts for each video/cell/analysis TOML.
+- Added latest failed attempt and latest failure reason columns.
+- Added failure-history filters, including failed/not-approved and failed/approved-replacement.
+- Existing local index searches refresh failure history from Firebird without requiring a full recursive rebuild.

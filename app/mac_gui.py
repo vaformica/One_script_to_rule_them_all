@@ -12,6 +12,7 @@ import os
 import tempfile
 import uuid
 import base64
+import html
 from datetime import datetime
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from PyQt5.QtWidgets import (
 )
 import tomlkit
 from app.approval_matching import approval_key, apply_qc_statuses, normalize_qc_status
+from app.failure_matching import apply_failure_counts, failure_key
 from app.qc_rerun_matching import build_rerun_comparisons, attempt_number
 
 
@@ -414,6 +416,63 @@ class IndexWorker(QObject):
     def cancel(self):
         self._cancelled = True
 
+    def _load_failure_counts(self, ssh):
+        if not self.project_root:
+            return {}
+        scanner = r'''
+import json, sys
+from pathlib import Path
+root=Path(sys.argv[1])
+
+def key(video,cell,analysis):
+    return (Path(str(video or "")).name.lower(), str(cell or "").strip().upper(), str(analysis or "").strip().lower())
+
+def read(path, limit=120000):
+    try: return Path(path).read_text(errors="replace")[-limit:]
+    except Exception: return ""
+
+def failed(run_dir):
+    exit_text=read(run_dir/"status"/"idtracker_exit_code.txt",1000).strip()
+    stage=read(run_dir/"status"/"stage.txt",5000)
+    tracking=read(run_dir/"status"/"tracking.txt",5000)
+    logs=""
+    log_dir=run_dir/"logs"
+    if log_dir.exists():
+        for f in sorted(log_dir.glob("*")):
+            if f.suffix in {".out",".err"}: logs += "\n"+read(f,50000)
+    combined=(stage+"\n"+tracking+"\n"+logs).lower()
+    is_failed=(exit_text not in {"","0"}) or any(x in combined for x in ["critical ","traceback","filenotfounderror","dependencyneversatisfied"," failed","error:"])
+    reason=""
+    if is_failed:
+        for line in reversed((stage+"\n"+tracking+"\n"+logs).splitlines()):
+            low=line.lower().strip()
+            if any(t in low for t in ["critical","filenotfounderror","traceback","error","failed","cancelled","timeout","out of memory"]):
+                reason=line.strip()[:300]; break
+    return is_failed,reason
+
+out={}
+for meta_path in root.glob("runs/**/run_metadata.json"):
+    run_dir=meta_path.parent
+    try: meta=json.loads(meta_path.read_text(errors="replace"))
+    except Exception: continue
+    is_failed,reason=failed(run_dir)
+    if not is_failed: continue
+    k=key(meta.get("video_filename") or meta.get("video_path"),meta.get("cell_label"),meta.get("analysis_type"))
+    rank=(str(meta.get("run_timestamp") or ""), int(meta.get("run_index") or 0))
+    rec=out.setdefault("|".join(k),{"failed_count":0,"rank":["",0]})
+    rec["failed_count"] += 1
+    if rank >= tuple(rec["rank"]):
+        rec.update({"rank":list(rank),"latest_failed_run_index":meta.get("run_index") or "","latest_failed_timestamp":meta.get("run_timestamp") or "","latest_failed_run_dir":str(run_dir),"latest_failure_reason":reason})
+for rec in out.values(): rec.pop("rank",None)
+print(json.dumps(out))
+'''
+        encoded = base64.b64encode(scanner.encode()).decode()
+        payload = 'import base64;exec(base64.b64decode("' + encoded + '"))'
+        command = f"python3 -c {shlex.quote(payload)} {shlex.quote(self.project_root)}"
+        text = ssh.run(command, timeout=180, retries=0)
+        raw = json.loads(text or '{}')
+        return {tuple(k.split('|', 2)): v for k, v in raw.items()}
+
     def _load_qc_statuses(self, ssh):
         if not self.project_root:
             return {}
@@ -437,6 +496,7 @@ class IndexWorker(QObject):
             index = LocalIndex(self.db_path)
             ssh = SSH(self.host, self.key)
             qc_records = self._load_qc_statuses(ssh)
+            failure_records = self._load_failure_counts(ssh)
 
             if not self.rebuild:
                 rows, summary = index.load(self.search_root)
@@ -447,6 +507,7 @@ class IndexWorker(QObject):
                     )
                 video_count, toml_count, matched_count, indexed_at = summary
                 rows = apply_qc_statuses(rows, qc_records)
+                rows = apply_failure_counts(rows, failure_records)
                 self.finished.emit(
                     rows,
                     int(video_count),
@@ -619,6 +680,7 @@ class IndexWorker(QObject):
                     })
 
             rows = apply_qc_statuses(rows, qc_records)
+            rows = apply_failure_counts(rows, failure_records)
             index.replace(
                 self.search_root,
                 rows,
@@ -903,6 +965,109 @@ class JobStatesWorker(QObject):
             if 'ssh' in locals(): ssh.close()
 
 
+class FailedRunTriageWorker(QObject):
+    finished = pyqtSignal(list)
+    failed = pyqtSignal(str)
+
+    def __init__(self, host, key, project_root):
+        super().__init__()
+        self.host = host
+        self.key = key
+        self.project_root = project_root.rstrip("/")
+
+    def run(self):
+        ssh = None
+        try:
+            scanner = r'''
+import csv, json, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+qc_path = root / "QC" / "run_status.csv"
+qc = []
+if qc_path.exists():
+    with qc_path.open(newline="", errors="replace") as fh:
+        qc = list(csv.DictReader(fh))
+
+def norm_status(v):
+    v=(v or "").strip().upper()
+    return {"DONE":"APPROVED", "RERUN":"NEEDS RERUN"}.get(v,v or "PENDING")
+
+def key(video, cell, analysis):
+    return (Path(video or "").stem.lower(), (cell or "").strip().upper(), (analysis or "").strip().lower())
+
+def rank(rec):
+    return (str(rec.get("date_run") or ""), str(rec.get("run_index") or ""), str(rec.get("collected_at") or ""), str(rec.get("record_id") or ""))
+
+approved_by_key={}
+for r in qc:
+    if norm_status(r.get("qc_decision")) == "APPROVED":
+        approved_by_key.setdefault(key(r.get("video"),r.get("cell"),r.get("analysis")),[]).append(r)
+for values in approved_by_key.values(): values.sort(key=rank)
+
+new_terms=["no blobs","0 detected blobs","no animal","region of interest","more blobs than animals","less blobs than animals","check segmentation","blob area","intensity threshold","segmentation error","invalid polygon"]
+rerun_terms=["bbox_images_","no such file or directory","unable to synchronously open file","out_of_memory","out of memory","oom","time limit","timeout","node_fail","cancelled","filesystem","input/output error","connection reset","slurmstepd"]
+
+def read_text(path, limit=220000):
+    try: return Path(path).read_text(errors="replace")[-limit:]
+    except Exception: return ""
+
+rows=[]
+for meta_path in root.glob("runs/**/run_metadata.json"):
+    run_dir=meta_path.parent
+    try: meta=json.loads(meta_path.read_text(errors="replace"))
+    except Exception: continue
+    exit_text=read_text(run_dir/"status"/"idtracker_exit_code.txt",1000).strip()
+    stage=read_text(run_dir/"status"/"stage.txt",5000).strip()
+    tracking=read_text(run_dir/"status"/"tracking.txt",5000).strip()
+    logs=""
+    log_dir=run_dir/"logs"
+    if log_dir.exists():
+        for f in sorted(log_dir.glob("*")):
+            if f.suffix in {".out",".err"}: logs += "\n"+read_text(f,100000)
+    combined=(stage+"\n"+tracking+"\n"+logs).lower()
+    failed=(exit_text not in {"","0"}) or any(x in combined for x in ["critical ","traceback","filenotfounderror","dependencyneversatisfied"," failed","error:"])
+    if not failed: continue
+    k=key(meta.get("video_filename") or meta.get("video_path"),meta.get("cell_label"),meta.get("analysis_type"))
+    this_time=str(meta.get("run_timestamp") or "")
+    this_index=int(meta.get("run_index") or 0)
+    later=[]
+    for a in approved_by_key.get(k,[]):
+        ai=str(a.get("run_index") or "")
+        later_by_index=ai.isdigit() and int(ai)>this_index
+        later_by_time=str(a.get("date_run") or "")>this_time
+        if later_by_index or later_by_time: later.append(a)
+    nh=[x for x in new_terms if x in combined]
+    rh=[x for x in rerun_terms if x in combined]
+    if later:
+        category="APPROVED REPLACEMENT EXISTS"; confidence="High"; suggestion="No new TOML or rerun appears necessary. Review the approved later attempt and mark the failed/older record superseded if appropriate."
+    elif rh and not nh:
+        category="RERUN EXISTING TOML"; confidence="High"; suggestion="Submit the existing TOML again. The failure appears computational, filesystem-related, or transient."
+    elif nh and not rh:
+        category="CONSIDER NEW TOML"; confidence="Medium"; suggestion="Inspect segmentation and consider recreating or adjusting the TOML before resubmitting."
+    elif nh and rh:
+        category="REVIEW; RERUN FIRST"; confidence="Medium"; suggestion="A transient failure and segmentation warnings both appear. Try the existing TOML once more; recreate it only if the segmentation problem repeats."
+    else:
+        category="REVIEW; LIKELY RERUN"; confidence="Low"; suggestion="The cause was not classified confidently. Inspect the evidence, but rerunning the existing TOML is the safest first step."
+    reason=""
+    for line in reversed((stage+"\n"+tracking+"\n"+logs).splitlines()):
+        low=line.lower().strip()
+        if any(t in low for t in ["critical","filenotfounderror","traceback","error","failed","cancelled","timeout","out of memory"]): reason=line.strip()[:500]; break
+    rows.append({"category":category,"confidence":confidence,"suggestion":suggestion,"video":meta.get("video_filename") or Path(meta.get("video_path") or "").name,"cell":meta.get("cell_label") or "","analysis":meta.get("analysis_type") or "","run_index":meta.get("run_index") or "","run_timestamp":meta.get("run_timestamp") or "","record_id":meta.get("record_id") or "","run_dir":str(run_dir),"toml_source_path":meta.get("toml_source_path") or "","toml_run_copy_path":meta.get("toml_run_copy_path") or "","idtracker_exit_code":exit_text,"failure_reason":reason,"matched_terms":", ".join(dict.fromkeys(nh+rh)),"approved_replacement_count":len(later),"approved_replacements":"; ".join(str(a.get("record_id") or a.get("run_dir") or "") for a in later)})
+rows.sort(key=lambda r:(r["category"],r["video"],r["cell"],str(r["run_timestamp"])))
+print(json.dumps(rows))
+'''
+            encoded = base64.b64encode(scanner.encode()).decode()
+            payload = 'import base64;exec(base64.b64decode("' + encoded + '"))'
+            command = f"python3 -c {shlex.quote(payload)} {shlex.quote(self.project_root)}"
+            ssh = SSH(self.host, self.key, connect_timeout=8, command_timeout=180)
+            output = ssh.run(command, timeout=180, retries=0)
+            self.finished.emit(json.loads(output or "[]"))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if ssh is not None: ssh.close()
+
+
 class Window(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -919,6 +1084,8 @@ class Window(QMainWindow):
         self.remote_worker = None
         self.job_states_thread = None
         self.job_states_worker = None
+        self.failed_report_thread = None
+        self.failed_report_worker = None
         self.index_db_path = str(
             Path.home() / '.beetle_idtracker' / 'firebird_index.sqlite3'
         )
@@ -1021,9 +1188,14 @@ class Window(QMainWindow):
         self.approved_filter.addItems(["All QC statuses", "Unscored only", "Scored only", "PENDING", "APPROVED", "NEEDS RERUN", "RERUNNING", "SUPERSEDED"])
         self.approved_filter.currentTextChanged.connect(self.apply_scan_filter)
         selection.addWidget(self.approved_filter)
+        selection.addWidget(QLabel("Run failures:"))
+        self.failure_filter = QComboBox()
+        self.failure_filter.addItems(["All failure histories", "Has failed runs", "No failed runs", "Failed and not approved", "Failed but approved replacement exists"])
+        self.failure_filter.currentTextChanged.connect(self.apply_scan_filter)
+        selection.addWidget(self.failure_filter)
         layout.addLayout(selection)
 
-        self.table = QTableWidget(0, 11)
+        self.table = QTableWidget(0, 14)
         self.table.setSortingEnabled(True)
         self.table.setAlternatingRowColors(True)
         self.table.setHorizontalHeaderLabels([
@@ -1036,6 +1208,9 @@ class Window(QMainWindow):
             "Blob max",
             "Background threshold min",
             "QC score/status",
+            "Failed attempts",
+            "Latest failed attempt",
+            "Latest failure reason",
             "Status",
             "Reason",
         ])
@@ -1043,7 +1218,7 @@ class Window(QMainWindow):
             QHeaderView.ResizeToContents
         )
         self.table.horizontalHeader().setSectionResizeMode(
-            10,
+            12,
             QHeaderView.Stretch,
         )
         layout.addWidget(self.table)
@@ -1153,6 +1328,10 @@ class Window(QMainWindow):
         refresh_all = QPushButton("Refresh All Job States")
         refresh_all.clicked.connect(self.refresh_all_job_states)
         buttons.addWidget(refresh_all)
+
+        failed_report = QPushButton("Create Failed Run Triage Report")
+        failed_report.clicked.connect(self.create_failed_run_triage_report)
+        buttons.addWidget(failed_report)
 
         diagnose = QPushButton("Diagnose Selected Run")
         diagnose.clicked.connect(self.retrieve_selected_diagnostics)
@@ -1439,10 +1618,13 @@ class Window(QMainWindow):
         approved_count = sum(row.get("qc_status") == "APPROVED" for row in rows)
         rerun_count = sum(row.get("qc_status") == "NEEDS RERUN" for row in rows)
         scored_count = sum(row.get("qc_status") not in (None, "", "UNSCORED") for row in rows)
+        failed_tomls = sum(int(row.get("failed_count") or 0) > 0 for row in rows)
+        failed_attempts = sum(int(row.get("failed_count") or 0) for row in rows)
         self.summary.setText(
             f"Index dated {timestamp}: {video_count:,} videos, "
             f"{toml_count:,} TOMLs, {matched_count:,} exact matches; "
-            f"{scored_count:,} scored ({approved_count:,} approved, {rerun_count:,} need rerun)."
+            f"{scored_count:,} scored ({approved_count:,} approved, {rerun_count:,} need rerun); "
+            f"{failed_tomls:,} TOMLs have {failed_attempts:,} failed attempt(s)."
         )
         self.finish_index_ui()
 
@@ -1493,7 +1675,14 @@ class Window(QMainWindow):
             if row.get("qc_notes"):
                 qc_text += f" | {row['qc_notes']}"
             self.table.setItem(i, 8, QTableWidgetItem(qc_text))
-            for c, key in ((5, "area_min"), (6, "area_max"), (7, "background_min"), (9, "status"), (10, "reason")):
+            failed_count = int(row.get("failed_count") or 0)
+            self.table.setItem(i, 9, QTableWidgetItem(str(failed_count)))
+            latest_attempt = ""
+            if failed_count:
+                latest_attempt = f"R{row.get('latest_failed_run_index', '')} | {row.get('latest_failed_timestamp', '')}".strip(" |")
+            self.table.setItem(i, 10, QTableWidgetItem(latest_attempt))
+            self.table.setItem(i, 11, QTableWidgetItem(str(row.get("latest_failure_reason", ""))))
+            for c, key in ((5, "area_min"), (6, "area_max"), (7, "background_min"), (12, "status"), (13, "reason")):
                 self.table.setItem(i, c, QTableWidgetItem(str(row[key])))
         self.table.setSortingEnabled(True)
         self.apply_scan_filter()
@@ -1502,6 +1691,7 @@ class Window(QMainWindow):
         if not hasattr(self, "table") or not hasattr(self, "approved_filter"):
             return
         mode = self.approved_filter.currentText()
+        failure_mode = self.failure_filter.currentText() if hasattr(self, "failure_filter") else "All failure histories"
         needle = (self.toml_filter.text() if hasattr(self, "toml_filter") else "").strip().lower()
         for table_row in range(self.table.rowCount()):
             item = self.table.item(table_row, 0)
@@ -1527,8 +1717,19 @@ class Window(QMainWindow):
                 status_visible = qc_status != "UNSCORED"
             else:
                 status_visible = qc_status == mode.upper()
+            failed_count = int(data.get("failed_count") or 0) if isinstance(data, dict) else 0
+            if failure_mode == "All failure histories":
+                failure_visible = True
+            elif failure_mode == "Has failed runs":
+                failure_visible = failed_count > 0
+            elif failure_mode == "No failed runs":
+                failure_visible = failed_count == 0
+            elif failure_mode == "Failed and not approved":
+                failure_visible = failed_count > 0 and qc_status != "APPROVED"
+            else:
+                failure_visible = failed_count > 0 and qc_status == "APPROVED"
             search_visible = not needle or needle in haystack
-            self.table.setRowHidden(table_row, not (status_visible and search_visible))
+            self.table.setRowHidden(table_row, not (status_visible and failure_visible and search_visible))
 
     def postprocess_args(self, analysis):
         p=self.param
@@ -1754,6 +1955,59 @@ class Window(QMainWindow):
             self.remote_thread.deleteLater()
         self.remote_worker = None
         self.remote_thread = None
+
+    def create_failed_run_triage_report(self):
+        if self.failed_report_thread is not None:
+            self.diagnostics_output.setPlainText("A failed-run report is already being created.")
+            return
+        self.diagnostics_output.setPlainText("Scanning recorded runs and comparing failures with later APPROVED QC records…\n\nThis runs in the background.")
+        self.failed_report_thread = QThread(self)
+        self.failed_report_worker = FailedRunTriageWorker(self.host.text().strip(), self.key.text().strip(), self.project_root.text().strip())
+        self.failed_report_worker.moveToThread(self.failed_report_thread)
+        self.failed_report_thread.started.connect(self.failed_report_worker.run)
+        self.failed_report_worker.finished.connect(self._failed_run_report_finished)
+        self.failed_report_worker.failed.connect(self._failed_run_report_failed)
+        self.failed_report_worker.finished.connect(self.failed_report_thread.quit)
+        self.failed_report_worker.failed.connect(self.failed_report_thread.quit)
+        self.failed_report_thread.finished.connect(self._cleanup_failed_report_thread)
+        self.failed_report_thread.start()
+
+    def _failed_run_report_finished(self, rows):
+        out_dir = Path.home() / "Downloads" / "IDtracker_Results" / "Failed_Run_Reports"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = out_dir / f"failed_run_triage_{stamp}.csv"
+        html_path = out_dir / f"failed_run_triage_{stamp}.html"
+        fields = ["category","confidence","video","cell","analysis","run_index","run_timestamp","idtracker_exit_code","failure_reason","suggestion","toml_source_path","toml_run_copy_path","approved_replacement_count","approved_replacements","record_id","run_dir","matched_terms"]
+        with csv_path.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fields, extrasaction="ignore"); writer.writeheader(); writer.writerows(rows)
+        counts={}
+        for r in rows: counts[r.get("category","UNKNOWN")]=counts.get(r.get("category","UNKNOWN"),0)+1
+        order=["CONSIDER NEW TOML","APPROVED REPLACEMENT EXISTS","RERUN EXISTING TOML","REVIEW; RERUN FIRST","REVIEW; LIKELY RERUN"]
+        sections=[]
+        for category in order:
+            group=[r for r in rows if r.get("category")==category]
+            if not group: continue
+            body=[]
+            for r in group:
+                vals=[r.get("video",""),r.get("cell",""),r.get("analysis",""),r.get("run_timestamp",""),r.get("confidence",""),r.get("failure_reason",""),r.get("suggestion",""),r.get("toml_source_path",""),r.get("approved_replacements","")]
+                body.append("<tr>"+"".join(f"<td>{html.escape(str(v))}</td>" for v in vals)+"</tr>")
+            sections.append(f"<h2>{html.escape(category)} ({len(group)})</h2><table><thead><tr><th>Video</th><th>Cell</th><th>Analysis</th><th>Failed run</th><th>Confidence</th><th>Evidence</th><th>Suggested action</th><th>TOML</th><th>Approved replacement</th></tr></thead><tbody>{''.join(body)}</tbody></table>")
+        summary="".join(f"<li><strong>{html.escape(k)}</strong>: {v}</li>" for k,v in counts.items()) or "<li>No failed runs found.</li>"
+        html_path.write_text(f"<!doctype html><html><head><meta charset='utf-8'><title>Failed Run Triage</title><style>body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:32px;line-height:1.35}}table{{border-collapse:collapse;width:100%;margin-bottom:32px;font-size:13px}}th,td{{border:1px solid #ccc;padding:7px;vertical-align:top}}th{{background:#f2f2f2}}.note{{background:#fff7d6;padding:12px;border-radius:8px}}</style></head><body><h1>Beetle IDtracker Failed Run Triage</h1><p>Generated {html.escape(datetime.now().isoformat(timespec='seconds'))}</p><div class='note'><strong>Interpretation:</strong> Categories are suggestions based on logs and QC history. Review uncertain cases before replacing TOMLs.</div><h2>Summary</h2><ul>{summary}</ul>{''.join(sections)}</body></html>", encoding="utf-8")
+        preview=[f"Failed-run triage complete: {len(rows)} failed run(s).",""]+[f"{k}: {counts[k]}" for k in order if counts.get(k)]+["",f"HTML report: {html_path}",f"CSV report: {csv_path}"]
+        self.diagnostics_output.setPlainText("\n".join(preview))
+        try: subprocess.Popen(["open", str(html_path)])
+        except Exception: pass
+        QMessageBox.information(self,"Failed run report created",f"Created:\n{html_path}\n\n{csv_path}")
+
+    def _failed_run_report_failed(self, message):
+        self.diagnostics_output.setPlainText("Could not create the failed-run report because Firebird disconnected or did not respond:\n"+message)
+
+    def _cleanup_failed_report_thread(self):
+        if self.failed_report_worker is not None: self.failed_report_worker.deleteLater()
+        if self.failed_report_thread is not None: self.failed_report_thread.deleteLater()
+        self.failed_report_worker=None; self.failed_report_thread=None
 
     def retrieve_selected_diagnostics(self):
         job = self.selected_job()
