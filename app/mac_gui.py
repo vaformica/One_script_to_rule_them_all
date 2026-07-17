@@ -18,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from PyQt5.QtCore import Qt, QObject, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QObject, QThread, pyqtSignal, QTimer
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QPushButton, QLabel, QTabWidget, QTableWidget, QTableWidgetItem,
@@ -82,6 +82,25 @@ def find_values(obj, keys):
         for v in obj:
             found.extend(find_values(v, keys))
     return found
+
+
+def extract_analysis_start_frame(obj):
+    """Return the first frame configured in an IDtracker tracking interval."""
+    candidates = []
+    def walk(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                normalized = str(key).lower().replace("-", "_").replace(" ", "_")
+                if "tracking_interval" in normalized:
+                    pair = _find_first_pair(child)
+                    if pair is not None:
+                        candidates.append(int(pair[0]))
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+    walk(obj)
+    return max(0, candidates[0]) if candidates else 0
 
 
 
@@ -567,6 +586,7 @@ class SubmitWorker(QObject):
     def _postprocess_args(analysis, p):
         if analysis == "fight":
             vals = {
+                "analysis-start-frame": p["analysis_start_frame"],
                 "analysis-stop-frame": p["analysis_stop_frame"],
                 "window-frames": p["window_frames"],
                 "contact-px": p["contact_px"],
@@ -576,6 +596,7 @@ class SubmitWorker(QObject):
             }
         else:
             vals = {
+                "analysis-start-frame": p["ba_analysis_start_frame"],
                 "analysis-stop-frame": p["ba_analysis_stop_frame"],
                 "move-threshold-px": p["move_threshold_px"],
                 "movement-onset-consecutive-frames": p["movement_onset_consecutive_frames"],
@@ -601,16 +622,17 @@ class SubmitWorker(QObject):
                 try:
                     now = datetime.now()
                     stamp = now.strftime("%Y%m%d_%H%M%S")
-                    run_index = int(ssh.run(
-                        f"mkdir -p {shlex.quote(self.project_root)}; "
-                        f"if [[ -f {shlex.quote(self.project_root + '/run_index.tsv')} ]]; then "
-                        f"awk -F'\\t' 'NR>1 && $1+0>m{{m=$1+0}} END{{print m+1}}' "
-                        f"{shlex.quote(self.project_root + '/run_index.tsv')}; else echo 1; fi"
-                    ).strip())
                     video_stem = Path(row["video"]).stem
+                    attempt_root = f"{self.project_root}/runs/{video_stem}/{row['cell']}"
+                    attempt_index = int(ssh.run(
+                        f"mkdir -p {shlex.quote(attempt_root)}; "
+                        f"find {shlex.quote(attempt_root)} -mindepth 1 -maxdepth 1 -type d "
+                        r"\( -name 'attempt_*' -o -name 'run_*' \) -printf '%f\n' 2>/dev/null | "
+                        r"sed -E 's/^(attempt|run)_0*([0-9]+).*/\2/' | "
+                        "awk '$1+0>m{m=$1+0} END{print m+1}'"
+                    ).strip() or "1")
                     run_dir = (
-                        f"{self.project_root}/runs/{video_stem}/{row['cell']}/"
-                        f"run_{run_index:05d}_{stamp}"
+                        f"{attempt_root}/attempt_{attempt_index:05d}_{stamp}"
                     )
                     input_dir = run_dir + "/input"
                     session_out = run_dir + "/idtracker"
@@ -619,6 +641,10 @@ class SubmitWorker(QObject):
                     self.progress.emit(f"Reading TOML for {label}...")
                     source = ssh.read(row["toml"])
                     doc = tomlkit.parse(source)
+                    toml_analysis_start = extract_analysis_start_frame(doc)
+                    effective_parameters = dict(self.parameters)
+                    effective_parameters["analysis_start_frame"] = toml_analysis_start
+                    effective_parameters["ba_analysis_start_frame"] = toml_analysis_start
                     updates = {"area": 0, "intensity": 0}
 
                     def edit_thresholds(obj):
@@ -645,7 +671,8 @@ class SubmitWorker(QObject):
                     _validate_thresholds(tomlkit.parse(rendered_toml))
                     ssh.write(copied_toml, rendered_toml)
                     metadata = {
-                        "run_index": run_index,
+                        "attempt_index": attempt_index,
+                        "run_index": attempt_index,
                         "run_timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
                         "analysis_type": analysis,
                         "video_path": row["video"],
@@ -655,14 +682,14 @@ class SubmitWorker(QObject):
                         "cell_label": row["cell"],
                         "remote_run_dir": run_dir,
                         "session_path": "",
-                        "record_id": f"{video_stem}_{row['cell']}_R{run_index:05d}_{stamp}",
+                        "record_id": f"{video_stem}_{row['cell']}_A{attempt_index:05d}_{stamp}",
                         "parameters": {
                             "area_min": area_min,
                             "area_max": None if math.isinf(area_max) else area_max,
                             "area_max_is_infinite": math.isinf(area_max),
                             "background_intensity_min": background_min,
                             "run_mode": self.run_mode,
-                            **self.parameters,
+                            **effective_parameters,
                         },
                     }
                     ssh.write(metadata_path, json.dumps(metadata, indent=2, allow_nan=False))
@@ -678,7 +705,7 @@ class SubmitWorker(QObject):
                         "PIPELINE_SESSION": "",
                         "PIPELINE_RUN_MODE": self.run_mode,
                         "PIPELINE_ARCHIVE_SESSION": "0",
-                        "PIPELINE_POSTPROCESS_EXTRA_ARGS": self._postprocess_args(analysis, self.parameters),
+                        "PIPELINE_POSTPROCESS_EXTRA_ARGS": self._postprocess_args(analysis, effective_parameters),
                     }
                     exports = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env.items())
                     command = f"export {exports}; bash {shlex.quote(self.repo_root + '/scripts/firebird/submit_pipeline_run.sh')}"
@@ -691,7 +718,8 @@ class SubmitWorker(QObject):
                             if key in job_ids:
                                 job_ids[key] = value.strip()
                     job = {
-                        "run_index": run_index,
+                        "attempt_index": attempt_index,
+                        "run_index": attempt_index,
                         "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
                         "label": label,
                         "idtracker_job": job_ids["IDTRACKER_JOB"],
@@ -701,13 +729,37 @@ class SubmitWorker(QObject):
                         "run_dir": run_dir,
                     }
                     self.job_submitted.emit(job)
-                    messages.append(f"Run {run_index:05d}: {result.strip()}")
+                    messages.append(f"Attempt {attempt_index:05d}: {result.strip()}")
                 except Exception as exc:
                     messages.append(f"{row['toml']}: ERROR {exc}")
                     self.progress.emit(f"Submission error for {label}: {exc}")
             self.finished.emit(messages)
         except Exception as exc:
             self.failed.emit(str(exc))
+
+class RecoveryWorker(QObject):
+    finished = pyqtSignal(list)
+    failed = pyqtSignal(str)
+
+    def __init__(self, host, key, project_root, repo_root):
+        super().__init__()
+        self.host = host; self.key = key
+        self.project_root = project_root.rstrip('/')
+        self.repo_root = repo_root.rstrip('/')
+
+    def run(self):
+        try:
+            ssh = SSH(self.host, self.key)
+            script = self.repo_root + '/scripts/firebird/recover_runs.py'
+            command = (
+                f"python {shlex.quote(script)} --project-root {shlex.quote(self.project_root)} "
+                f"--repo-root {shlex.quote(self.repo_root)} --repair"
+            )
+            output = ssh.run(command, timeout=600)
+            self.finished.emit(json.loads(output or '[]'))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
 
 class Window(QMainWindow):
     def __init__(self):
@@ -719,11 +771,14 @@ class Window(QMainWindow):
         self.submit_thread = None
         self.submit_worker = None
         self.index_worker = None
+        self.recovery_thread = None
+        self.recovery_worker = None
         self.index_db_path = str(
             Path.home() / '.beetle_idtracker' / 'firebird_index.sqlite3'
         )
         self.setWindowTitle("Beetle IDtracker Unified Pipeline")
-        self.resize(1500, 850)
+        self.resize(1720, 980)
+        self.setMinimumSize(1350, 780)
         tabs = QTabWidget()
         tabs.addTab(self.connection_page(), "1. Connection")
         tabs.addTab(self.scan_page(), "2. Scan and Match")
@@ -732,6 +787,7 @@ class Window(QMainWindow):
         tabs.addTab(self.diagnostics_page(), "5. Jobs and Diagnostics")
         tabs.addTab(self.qc_page(), "6. QC and Masters")
         self.setCentralWidget(tabs)
+        QTimer.singleShot(800, self.recover_runs)
 
     def connection_page(self):
         page = QWidget()
@@ -867,13 +923,16 @@ class Window(QMainWindow):
         archive_note=QLabel('IDtracker sessions remain in their canonical video-folder location. Copying or moving sessions is deferred and never performed during a run.'); archive_note.setWordWrap(True); layout.addWidget(archive_note)
         self.param={}
         specs={
-          'Fight':[('analysis_stop_frame','Analysis stop frame',0,0,100000000,1),('contact_px','Contact distance (px)',60,0,10000,.1),('fight_px','Fight distance (px)',35,0,10000,.1),('min_fight_frames','Minimum fight duration (frames)',6,1,100000,1),('roi_wall_buffer_px','Wall buffer (px)',30,0,10000,.1),('window_frames','Window frames',7500,1,100000000,1)],
-          'BA':[('ba_analysis_stop_frame','Analysis stop frame',0,0,100000000,1),('ba_roi_wall_buffer_px','Wall buffer (px)',30,0,10000,.1),('move_threshold_px','Movement threshold (px)',30,0,10000,.1),('movement_onset_consecutive_frames','Movement onset duration (frames)',30,1,100000,1),('turtling_window_frames','Turtle window (frames)',300,1,100000,1),('turtling_min_duration_frames','Turtle minimum duration (frames)',300,1,100000,1)]}
-        tips={'analysis_stop_frame':'0 means use Window frames','ba_analysis_stop_frame':'0 means use all configured frames','contact_px':'Distance defining contact','fight_px':'Stricter fight-distance threshold','roi_wall_buffer_px':'Inward ROI border width','ba_roi_wall_buffer_px':'Inward ROI border width'}
+          'Fight':[('analysis_start_frame','Analysis start frame (auto from TOML)',0,0,100000000,1),('analysis_stop_frame','Analysis stop frame',0,0,100000000,1),('contact_px','Contact distance (px)',60,0,10000,.1),('fight_px','Fight distance (px)',35,0,10000,.1),('min_fight_frames','Minimum fight duration (frames)',6,1,100000,1),('roi_wall_buffer_px','Wall buffer (px)',30,0,10000,.1),('window_frames','Window frames',7500,1,100000000,1)],
+          'BA':[('ba_analysis_start_frame','Analysis start frame (auto from TOML)',0,0,100000000,1),('ba_analysis_stop_frame','Analysis stop frame',0,0,100000000,1),('ba_roi_wall_buffer_px','Wall buffer (px)',30,0,10000,.1),('move_threshold_px','Movement threshold (px)',30,0,10000,.1),('movement_onset_consecutive_frames','Movement onset duration (frames)',30,1,100000,1),('turtling_window_frames','Turtle window (frames)',300,1,100000,1),('turtling_min_duration_frames','Turtle minimum duration (frames)',300,1,100000,1)]}
+        tips={'analysis_start_frame':'Automatically replaced with the first frame in the TOML tracking interval','ba_analysis_start_frame':'Automatically replaced with the first frame in the TOML tracking interval','analysis_stop_frame':'0 means use Window frames','ba_analysis_stop_frame':'0 means use all configured frames','contact_px':'Distance defining contact','fight_px':'Stricter fight-distance threshold','roi_wall_buffer_px':'Inward ROI border width','ba_roi_wall_buffer_px':'Inward ROI border width'}
         for title,rows in specs.items():
             box=QGroupBox(title); form=QFormLayout(box)
             for key,label,default,lo,hi,step in rows:
-                w=QSpinBox() if step==1 else QDoubleSpinBox(); w.setRange(lo,hi); w.setValue(default); w.setSingleStep(step); w.setToolTip(tips.get(key,label)); self.param[key]=w; form.addRow(label,w)
+                w=QSpinBox() if step==1 else QDoubleSpinBox(); w.setRange(lo,hi); w.setValue(default); w.setSingleStep(step); w.setToolTip(tips.get(key,label)); self.param[key]=w
+                if key in {'analysis_start_frame','ba_analysis_start_frame'}:
+                    w.setEnabled(False)
+                form.addRow(label,w)
             layout.addWidget(box)
         layout.addStretch(); return page
 
@@ -910,7 +969,7 @@ class Window(QMainWindow):
 
         self.jobs_table = QTableWidget(0, 8)
         self.jobs_table.setHorizontalHeaderLabels([
-            "Run", "Date/time", "Video/cell", "IDtracker job",
+            "Attempt", "Date/time", "Video/cell", "IDtracker job",
             "Post-process job", "Collector job", "Status", "Remote run folder"
         ])
         self.jobs_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -924,9 +983,13 @@ class Window(QMainWindow):
         self.jobs_table.itemSelectionChanged.connect(
             self.retrieve_selected_diagnostics
         )
-        layout.addWidget(self.jobs_table)
+        layout.addWidget(self.jobs_table, 3)
 
         buttons = QHBoxLayout()
+
+        recover = QPushButton("Recover Runs from Firebird")
+        recover.clicked.connect(self.recover_runs)
+        buttons.addWidget(recover)
 
         refresh_all = QPushButton("Refresh All Job States")
         refresh_all.clicked.connect(self.refresh_all_job_states)
@@ -959,6 +1022,7 @@ class Window(QMainWindow):
         self.diagnostics_output.setPlaceholderText(
             "Diagnostics for the selected run will appear here."
         )
+        self.diagnostics_output.setMaximumHeight(210)
         layout.addWidget(self.diagnostics_output, 1)
         return page
 
@@ -1225,7 +1289,7 @@ class Window(QMainWindow):
         for i, row in enumerate(self.rows):
             use = QTableWidgetItem()
             use.setFlags(Qt.ItemIsEnabled | Qt.ItemIsUserCheckable)
-            use.setCheckState(Qt.Checked if row["use"] else Qt.Unchecked)
+            use.setCheckState(Qt.Unchecked)
             use.setData(Qt.UserRole, row)
             self.table.setItem(i, 0, use)
             for c, key in enumerate(("video", "cell", "toml"), 1):
@@ -1373,7 +1437,7 @@ class Window(QMainWindow):
         self.jobs_table.setRowCount(len(self.jobs))
         for row_number, job in enumerate(self.jobs):
             values = [
-                f"{int(job['run_index']):05d}",
+                f"{int(job.get('attempt_index', job.get('run_index', 1))):05d}",
                 job["timestamp"],
                 job["label"],
                 job.get("idtracker_job", ""),
@@ -1386,6 +1450,50 @@ class Window(QMainWindow):
                 item = QTableWidgetItem(str(value))
                 item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                 self.jobs_table.setItem(row_number, column, item)
+
+
+    def recover_runs(self):
+        if self.recovery_thread is not None:
+            return
+        if hasattr(self, 'diagnostics_output'):
+            self.diagnostics_output.setPlainText('Recovering prior runs from Firebird and repairing any completed-but-uncollected outputs...')
+        self.recovery_thread = QThread(self)
+        self.recovery_worker = RecoveryWorker(
+            self.host.text().strip(), self.key.text().strip(),
+            self.project_root.text().strip(), self.repo_root.text().strip()
+        )
+        self.recovery_worker.moveToThread(self.recovery_thread)
+        self.recovery_thread.started.connect(self.recovery_worker.run)
+        self.recovery_worker.finished.connect(self._recovery_finished)
+        self.recovery_worker.failed.connect(self._recovery_failed)
+        self.recovery_worker.finished.connect(self.recovery_thread.quit)
+        self.recovery_worker.failed.connect(self.recovery_thread.quit)
+        self.recovery_thread.finished.connect(self._cleanup_recovery_thread)
+        self.recovery_thread.start()
+
+    def _recovery_finished(self, recovered):
+        dedup = {j['run_dir']: j for j in self.jobs}
+        for job in recovered:
+            dedup[job['run_dir']] = job
+        self.jobs = sorted(dedup.values(), key=lambda j: j.get('timestamp',''), reverse=True)
+        self.populate_jobs_table()
+        repaired = sum(j.get('status') == 'Recovery collector submitted' for j in recovered)
+        self.diagnostics_output.setPlainText(
+            f"Recovered {len(recovered)} run(s) from Firebird. "
+            f"Submitted {repaired} missing collector job(s). Refresh QC after those collector jobs finish."
+        )
+        self.refresh_qc()
+
+    def _recovery_failed(self, message):
+        if hasattr(self, 'diagnostics_output'):
+            self.diagnostics_output.setPlainText(
+                f"Recovery could not connect to Firebird:\n{message}"
+            )
+
+    def _cleanup_recovery_thread(self):
+        if self.recovery_worker is not None: self.recovery_worker.deleteLater()
+        if self.recovery_thread is not None: self.recovery_thread.deleteLater()
+        self.recovery_worker = None; self.recovery_thread = None
 
     def selected_job(self):
         if not hasattr(self, "jobs_table"):

@@ -14,4 +14,4 @@ def test_columns():
         remote_run_dir="/r",
     )
     assert m.csv_columns()["pipeline_run_index"] == 1
-    assert "Run 00001" in m.png_label()
+    assert "Attempt 00001" in m.png_label()

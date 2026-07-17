@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.9.19 - Automatic recovery, attempt indexing, and analysis start frames
+
+- Added nonblocking startup recovery from Firebird as the source of truth.
+- Added a Recover Runs from Firebird button and automatic reconstruction of the Submitted Jobs table.
+- Automatically resubmits the collector for completed post-processing runs that never reached QC.
+- Enlarged the main window and Submitted Jobs table while reducing the diagnostics text area.
+- Replaced the global run number shown to users with a per-video/per-cell Attempt number.
+- New run folders and record IDs use attempt_00001 and A00001 naming. Legacy run_ folders remain readable.
+- Scan & Match rows now start unchecked.
+- Analysis start frame is read from the first IDtracker tracking interval in each TOML and passed to BA and fight post-processing.
+- Added compatibility columns for legacy pipeline_run_index plus the new pipeline_attempt_index.
+
 ## 0.9.17 - Full QC status in Scan & Match
 
 - Replaced the approval-only Scan & Match column with the latest QC score/status for each exact video, cell, and analysis match.

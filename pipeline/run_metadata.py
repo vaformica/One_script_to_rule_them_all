@@ -18,6 +18,7 @@ class RunMetadata:
     cell_label: str
     remote_run_dir: str
     session_path: str = ""
+    attempt_index: int = 0
     record_id: str = ""
     idtracker_job_id: str = ""
     postprocess_job_id: str = ""
@@ -33,7 +34,12 @@ class RunMetadata:
 
     @classmethod
     def from_json(cls, path: str | Path) -> "RunMetadata":
-        return cls(**json.loads(Path(path).read_text(encoding="utf-8")))
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if "attempt_index" not in data:
+            data["attempt_index"] = int(data.get("run_index", 1))
+        if "run_index" not in data:
+            data["run_index"] = int(data.get("attempt_index", 1))
+        return cls(**data)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -52,11 +58,12 @@ class RunMetadata:
         stamp = "".join(c for c in self.run_timestamp if c.isdigit())
         video = Path(self.video_filename).stem
         safe = lambda x: "".join(c if c.isalnum() or c in "-_" else "_" for c in str(x))
-        return f"{safe(video)}_{safe(self.cell_label)}_R{self.run_index:05d}_{stamp}"
+        return f"{safe(video)}_{safe(self.cell_label)}_A{(self.attempt_index or self.run_index):05d}_{stamp}"
 
     def csv_columns(self) -> dict[str, Any]:
         return {
             "pipeline_record_id": self.identifier(),
+            "pipeline_attempt_index": self.attempt_index or self.run_index,
             "pipeline_run_index": self.run_index,
             "pipeline_run_timestamp": self.run_timestamp,
             "pipeline_analysis_type": self.analysis_type,
@@ -84,7 +91,7 @@ class RunMetadata:
     def png_label_lines(self) -> list[str]:
         return [
             f"{self.camera_label()}  |  Cell {self.cell_label}  |  {self.analysis_type.upper()}",
-            f"Run {self.run_index:05d}  |  Date run: {self.run_timestamp}",
+            f"Attempt {(self.attempt_index or self.run_index):05d}  |  Date run: {self.run_timestamp}",
             f"Video: {self.video_filename}",
             f"Record ID: {self.identifier()}",
         ]
