@@ -282,3 +282,16 @@
 - Added latest failed attempt and latest failure reason columns.
 - Added failure-history filters, including failed/not-approved and failed/approved-replacement.
 - Existing local index searches refresh failure history from Firebird without requiring a full recursive rebuild.
+
+## 0.9.25 — Fast QC decisions
+- QC decision clicks now use a lightweight server-side update that does not rebuild master summaries for every record.
+- The QC table updates locally instead of performing a second SSH refresh after every click.
+- After a decision, the next visible PENDING row is selected automatically.
+- Master summaries are rebuilt automatically immediately before Download Masters.
+
+## v0.9.26 — Rapid QC review
+- Added local prefetch/cache for upcoming fight track PDFs.
+- Added Rapid Review mode that opens the next cached PDF automatically after a decision.
+- QC decisions update the table immediately and save to Firebird in background threads.
+- Added keyboard shortcuts: A approve, R needs rerun, Space open PDF, N next.
+- Added cache status feedback and cache-first PDF opening.

@@ -29,8 +29,9 @@ from PyQt5.QtWidgets import (
     QLineEdit, QPushButton, QLabel, QTabWidget, QTableWidget, QTableWidgetItem,
     QHeaderView, QMessageBox, QFileDialog, QComboBox, QCheckBox, QTextEdit,
     QAbstractItemView, QProgressBar, QGroupBox, QSpinBox, QDoubleSpinBox,
-    QRadioButton, QButtonGroup
+    QRadioButton, QButtonGroup, QShortcut
 )
+from PyQt5.QtGui import QKeySequence
 import tomlkit
 from app.approval_matching import approval_key, apply_qc_statuses, normalize_qc_status
 from app.failure_matching import apply_failure_counts, failure_key
@@ -965,6 +966,65 @@ class JobStatesWorker(QObject):
             if 'ssh' in locals(): ssh.close()
 
 
+class QCDecisionWorker(QObject):
+    finished = pyqtSignal(str, str)
+    failed = pyqtSignal(str, str, str)
+
+    def __init__(self, host, key, command, record_id, decision):
+        super().__init__()
+        self.host=host; self.key=key; self.command=command
+        self.record_id=record_id; self.decision=decision
+
+    def run(self):
+        ssh=None
+        try:
+            ssh=SSH(self.host,self.key,connect_timeout=8,command_timeout=30)
+            ssh.run(self.command,timeout=30,retries=0,retry_safe=False)
+            self.finished.emit(self.record_id,self.decision)
+        except Exception as exc:
+            self.failed.emit(self.record_id,self.decision,str(exc))
+        finally:
+            if ssh is not None: ssh.close()
+
+
+class QCPrefetchWorker(QObject):
+    cached = pyqtSignal(str, str)
+    finished = pyqtSignal()
+    failed = pyqtSignal(str)
+
+    def __init__(self, host, key, records, cache_root):
+        super().__init__()
+        self.host=host; self.key=str(Path(key).expanduser())
+        self.records=list(records); self.cache_root=Path(cache_root)
+
+    def run(self):
+        try:
+            self.cache_root.mkdir(parents=True,exist_ok=True)
+            for rec in self.records:
+                rid=rec.get('record_id','').strip()
+                run_dir=rec.get('run_dir','').rstrip('/')
+                if not rid or not run_dir: continue
+                dest=self.cache_root/rid
+                pdfs=list(dest.glob('*_tracks.pdf')) if dest.exists() else []
+                if pdfs:
+                    self.cached.emit(rid,str(dest)); continue
+                dest.mkdir(parents=True,exist_ok=True)
+                remote=run_dir+'/outputs/QC_review_bundle/'
+                ssh_cmd=f'ssh -o BatchMode=yes -o ConnectTimeout=8 -i {shlex.quote(self.key)}'
+                cmd=['rsync','-az','--include=*_tracks.pdf','--include=*.png','--exclude=*','-e',ssh_cmd,f'{self.host}:{remote}',str(dest)+'/']
+                result=subprocess.run(cmd,capture_output=True,text=True,timeout=90)
+                if result.returncode != 0:
+                    # Older runs may not have a QC_review_bundle. Pull only review media from outputs.
+                    remote=run_dir+'/outputs/'
+                    cmd=['rsync','-az','--include=*_tracks.pdf','--include=*.png','--exclude=*','-e',ssh_cmd,f'{self.host}:{remote}',str(dest)+'/']
+                    result=subprocess.run(cmd,capture_output=True,text=True,timeout=90)
+                if result.returncode == 0:
+                    self.cached.emit(rid,str(dest))
+            self.finished.emit()
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class FailedRunTriageWorker(QObject):
     finished = pyqtSignal(list)
     failed = pyqtSignal(str)
@@ -1086,6 +1146,11 @@ class Window(QMainWindow):
         self.job_states_worker = None
         self.failed_report_thread = None
         self.failed_report_worker = None
+        self.qc_decision_threads = {}
+        self.qc_prefetch_thread = None
+        self.qc_prefetch_worker = None
+        self.qc_cache = {}
+        self.qc_rapid_review = False
         self.index_db_path = str(
             Path.home() / '.beetle_idtracker' / 'firebird_index.sqlite3'
         )
@@ -1366,7 +1431,7 @@ class Window(QMainWindow):
 
     def qc_page(self):
         page=QWidget();layout=QVBoxLayout(page)
-        note=QLabel("Review completed runs. Use Rerun comparison mode to place every NEEDS RERUN or RERUNNING record directly beside later attempts of the same video, cell, and analysis. Review both before manually marking the older record SUPERSEDED.");note.setWordWrap(True);layout.addWidget(note)
+        note=QLabel("Rapid Review caches upcoming PDFs on the Mac. Approve or Needs Rerun removes the item immediately, opens the next cached PDF, and saves the decision to Firebird in the background. Shortcuts: A = Approve, R = Needs Rerun, Space = open PDF, N = next row.");note.setWordWrap(True);layout.addWidget(note)
 
         filters=QHBoxLayout();filters.addWidget(QLabel("Search/filter:"))
         self.qc_filter=QLineEdit();self.qc_filter.setPlaceholderText("Search record ID, date, video, cell, status, notes, attempt, or comparison result")
@@ -1375,11 +1440,17 @@ class Window(QMainWindow):
         self.qc_view_mode=QComboBox();self.qc_view_mode.addItems(["All QC records","Rerun comparisons","Flagged with later attempt","Flagged without later attempt","Ready to review for superseding"]);self.qc_view_mode.currentTextChanged.connect(self.rebuild_qc_table);filters.addWidget(self.qc_view_mode)
         clear=QPushButton("Clear Filter");clear.clicked.connect(lambda:(self.qc_filter.clear(),self.qc_status_filter.setCurrentIndex(0),self.qc_view_mode.setCurrentIndex(0)));filters.addWidget(clear);layout.addLayout(filters)
 
-        self.qc_table=QTableWidget(0,13);self.qc_table.setHorizontalHeaderLabels(["Comparison","Record ID","Date run","Analysis","Video / Camera","Cell","Attempt","Pipeline","QC status","Replaces","Replaced by","Notes","Run folder"]);self.qc_table.setSelectionBehavior(QAbstractItemView.SelectRows);self.qc_table.setSortingEnabled(True);self.qc_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents);self.qc_table.horizontalHeader().setSectionResizeMode(11,QHeaderView.Stretch);self.qc_table.horizontalHeader().setSectionResizeMode(12,QHeaderView.Stretch);layout.addWidget(self.qc_table)
+        self.qc_table=QTableWidget(0,13);self.qc_table.setHorizontalHeaderLabels(["Comparison","Record ID","Date run","Analysis","Video / Camera","Cell","Attempt","Pipeline","QC status","Replaces","Replaced by","Notes","Run folder"]);self.qc_table.setSelectionBehavior(QAbstractItemView.SelectRows);self.qc_table.setSelectionMode(QAbstractItemView.SingleSelection);self.qc_table.setSortingEnabled(True);self.qc_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents);self.qc_table.horizontalHeader().setSectionResizeMode(11,QHeaderView.Stretch);self.qc_table.horizontalHeader().setSectionResizeMode(12,QHeaderView.Stretch);layout.addWidget(self.qc_table)
         row=QHBoxLayout()
-        for label,fn in [("Refresh QC",self.refresh_qc),("Show Rerun Comparisons",lambda:self.qc_view_mode.setCurrentText("Rerun comparisons")),("Save Notes",self.save_qc_notes),("Approve",lambda:self.set_qc_decision('APPROVED')),("Needs Rerun",lambda:self.set_qc_decision('RERUN')),("Mark Rerunning",lambda:self.set_qc_decision('RERUNNING')),("Mark Superseded",lambda:self.set_qc_decision('SUPERSEDED')),("Mark Pending",lambda:self.set_qc_decision('PENDING')),("Download Selected",self.download_selected_qc),("View Files",self.view_selected_qc_files),("Download Masters",self.download_master_spreadsheets)]:
+        actions=[("Refresh QC",self.refresh_qc),("Start Rapid Review",self.start_rapid_qc_review),("Open PDF  [Space]",self.view_selected_qc_files),("Approve  [A]",lambda:self.set_qc_decision('APPROVED')),("Needs Rerun  [R]",lambda:self.set_qc_decision('RERUN')),("Save Notes",self.save_qc_notes),("Mark Rerunning",lambda:self.set_qc_decision('RERUNNING')),("Mark Superseded",lambda:self.set_qc_decision('SUPERSEDED')),("Download Masters",self.download_master_spreadsheets)]
+        for label,fn in actions:
             b=QPushButton(label);b.clicked.connect(fn);row.addWidget(b)
-        layout.addLayout(row);self.qc_message=QLabel('');self.qc_message.setWordWrap(True);layout.addWidget(self.qc_message);return page
+        layout.addLayout(row)
+        self.qc_cache_status=QLabel('PDF cache: idle');layout.addWidget(self.qc_cache_status)
+        self.qc_message=QLabel('');self.qc_message.setWordWrap(True);layout.addWidget(self.qc_message)
+        for key,fn in [('A',lambda:self.set_qc_decision('APPROVED')),('R',lambda:self.set_qc_decision('RERUN')),('Space',self.view_selected_qc_files),('N',self._select_next_qc_and_open)]:
+            shortcut=QShortcut(QKeySequence(key),page);shortcut.setContext(Qt.WidgetWithChildrenShortcut);shortcut.activated.connect(fn)
+        return page
 
     def refresh_qc(self):
         try:
@@ -1388,6 +1459,8 @@ class Window(QMainWindow):
             self.qc_rows=list(csv.DictReader(io.StringIO(text))) if text.strip() else []
             self.rebuild_qc_table()
             self.qc_message.setText(f"Loaded {len(self.qc_rows)} collected runs. Rerun comparison mode found {len(build_rerun_comparisons(self.qc_rows))} comparison rows.")
+            self._select_next_pending_qc_row(0)
+            self.prefetch_upcoming_qc(8)
         except Exception as exc: QMessageBox.critical(self,'QC refresh failed',str(exc))
 
     def _qc_display_rows(self):
@@ -1454,14 +1527,149 @@ class Window(QMainWindow):
             result=self.ssh().run(cmd);self.qc_message.setText(f"Saved notes for {rec['record_id']}. {result.strip()}");self.refresh_qc()
         except Exception as exc: QMessageBox.critical(self,'QC notes update failed',str(exc))
 
+    def _apply_local_qc_decision(self, record_id, decision, note):
+        normalized = 'NEEDS RERUN' if decision == 'RERUN' else decision
+        target = next((r for r in getattr(self, 'qc_rows', []) if r.get('record_id') == record_id), None)
+        if target is None:
+            return
+        target['qc_decision'] = normalized
+        target['notes'] = note
+        if normalized == 'APPROVED':
+            superseded=[]
+            for old in self.qc_rows:
+                if old is target:
+                    continue
+                same=all((old.get(k,'') or '').strip()==(target.get(k,'') or '').strip() for k in ('video','cell','analysis'))
+                old_status=normalize_qc_status(old.get('qc_decision'))
+                if same and old_status in {'NEEDS RERUN','RERUNNING'}:
+                    old['qc_decision']='SUPERSEDED';old['replaced_by']=record_id;superseded.append(old.get('record_id',''))
+            if superseded:
+                target['replaces']=';'.join(x for x in superseded if x)
+
+    def _select_next_pending_qc_row(self, preferred_row=0):
+        if not hasattr(self,'qc_table') or not self.qc_table.rowCount():
+            return
+        total=self.qc_table.rowCount()
+        order=list(range(min(preferred_row,total),total))+list(range(0,min(preferred_row,total)))
+        fallback=None
+        for row in order:
+            if self.qc_table.isRowHidden(row):
+                continue
+            if fallback is None:fallback=row
+            status=(self.qc_table.item(row,8).text() if self.qc_table.item(row,8) else '').upper()
+            if status=='PENDING':
+                self.qc_table.selectRow(row);self.qc_table.scrollToItem(self.qc_table.item(row,1));return
+        if fallback is not None:
+            self.qc_table.selectRow(fallback);self.qc_table.scrollToItem(self.qc_table.item(fallback,1))
+
+    def _qc_cache_root(self):
+        return Path.home()/"Library"/"Caches"/"Beetle_IDtracker"/"QC"
+
+    def _visible_pending_records(self, limit=8):
+        records=[]
+        if not hasattr(self,'qc_table'): return records
+        selected=self.qc_table.selectionModel().selectedRows()
+        start=selected[0].row() if selected else 0
+        order=list(range(start,self.qc_table.rowCount()))+list(range(0,start))
+        for row in order:
+            if self.qc_table.isRowHidden(row): continue
+            status=(self.qc_table.item(row,8).text() if self.qc_table.item(row,8) else '').upper()
+            if status!='PENDING': continue
+            rec=self.qc_table.item(row,1).data(Qt.UserRole)
+            if rec and rec.get('record_id') not in self.qc_cache: records.append(rec)
+            if len(records)>=limit: break
+        return records
+
+    def prefetch_upcoming_qc(self, limit=8):
+        if self.qc_prefetch_thread is not None: return
+        records=self._visible_pending_records(limit)
+        if not records: return
+        self.qc_cache_status.setText(f'PDF cache: preparing {len(records)} upcoming review item(s)…')
+        self.qc_prefetch_thread=QThread(self)
+        self.qc_prefetch_worker=QCPrefetchWorker(self.host.text().strip(),self.key.text().strip(),records,str(self._qc_cache_root()))
+        self.qc_prefetch_worker.moveToThread(self.qc_prefetch_thread)
+        self.qc_prefetch_thread.started.connect(self.qc_prefetch_worker.run)
+        self.qc_prefetch_worker.cached.connect(self._qc_cached)
+        self.qc_prefetch_worker.finished.connect(self._qc_prefetch_finished)
+        self.qc_prefetch_worker.failed.connect(self._qc_prefetch_failed)
+        self.qc_prefetch_worker.finished.connect(self.qc_prefetch_thread.quit)
+        self.qc_prefetch_worker.failed.connect(self.qc_prefetch_thread.quit)
+        self.qc_prefetch_thread.finished.connect(self._cleanup_qc_prefetch)
+        self.qc_prefetch_thread.start()
+
+    def _qc_cached(self, record_id, path):
+        self.qc_cache[record_id]=path
+        self.qc_cache_status.setText(f'PDF cache: {len(self.qc_cache)} item(s) ready')
+
+    def _qc_prefetch_finished(self):
+        self.qc_cache_status.setText(f'PDF cache: {len(self.qc_cache)} item(s) ready')
+
+    def _qc_prefetch_failed(self, message):
+        self.qc_cache_status.setText(f'PDF cache paused: {message}')
+
+    def _cleanup_qc_prefetch(self):
+        if self.qc_prefetch_worker is not None:self.qc_prefetch_worker.deleteLater()
+        if self.qc_prefetch_thread is not None:self.qc_prefetch_thread.deleteLater()
+        self.qc_prefetch_worker=None;self.qc_prefetch_thread=None
+
+    def _open_cached_qc(self, rec):
+        rid=rec.get('record_id','')
+        dest=Path(self.qc_cache.get(rid,self._qc_cache_root()/rid))
+        pdfs=sorted(dest.glob('*_tracks.pdf')) if dest.exists() else []
+        if pdfs:
+            subprocess.Popen(['open',str(pdfs[0])])
+            self.qc_cache[rid]=str(dest)
+            return True
+        return False
+
+    def start_rapid_qc_review(self):
+        self.qc_rapid_review=True
+        if not self.selected_qc(): self._select_next_pending_qc_row(0)
+        self.prefetch_upcoming_qc(10)
+        self.view_selected_qc_files()
+
+    def _select_next_qc_and_open(self):
+        selected=self.qc_table.selectionModel().selectedRows() if hasattr(self,'qc_table') else []
+        row=(selected[0].row()+1) if selected else 0
+        self._select_next_pending_qc_row(row)
+        self.view_selected_qc_files()
+
     def set_qc_decision(self,decision):
         rec=self.selected_qc()
         if not rec:return
-        try:
-            note=self._selected_qc_note()
-            cmd=f"{shlex.quote(self.repo_root.text().rstrip('/')+'/scripts/firebird/set_qc_status.sh')} {shlex.quote(self.project_root.text())} {shlex.quote(rec['record_id'])} {shlex.quote(decision)} {shlex.quote(note)}"
-            result=self.ssh().run(cmd);self.qc_message.setText(f"{rec['record_id']} marked {decision}. {result.strip()}");self.refresh_qc()
-        except Exception as exc: QMessageBox.critical(self,'QC update failed',str(exc))
+        selected_rows=self.qc_table.selectionModel().selectedRows() if hasattr(self,'qc_table') else []
+        previous_row=selected_rows[0].row() if selected_rows else 0
+        note=self._selected_qc_note()
+        record_id=rec['record_id']
+        cmd=f"{shlex.quote(self.repo_root.text().rstrip('/')+'/scripts/firebird/set_qc_status.sh')} {shlex.quote(self.project_root.text())} {shlex.quote(record_id)} {shlex.quote(decision)} {shlex.quote(note)} --fast"
+        # Optimistic UI: remove/update now; network persistence happens in the background.
+        self._apply_local_qc_decision(record_id,decision,note)
+        self.rebuild_qc_table()
+        self._select_next_pending_qc_row(previous_row)
+        shown='NEEDS RERUN' if decision=='RERUN' else decision
+        self.qc_message.setText(f'{record_id} marked {shown} locally; saving to Firebird in background…')
+        thread=QThread(self);worker=QCDecisionWorker(self.host.text().strip(),self.key.text().strip(),cmd,record_id,decision)
+        worker.moveToThread(thread);thread.started.connect(worker.run)
+        worker.finished.connect(self._qc_decision_saved);worker.failed.connect(self._qc_decision_failed)
+        worker.finished.connect(thread.quit);worker.failed.connect(thread.quit)
+        thread.finished.connect(lambda rid=record_id:self._cleanup_qc_decision(rid))
+        self.qc_decision_threads[record_id]=(thread,worker);thread.start()
+        self.prefetch_upcoming_qc(8)
+        if self.qc_rapid_review:
+            QTimer.singleShot(80,self.view_selected_qc_files)
+
+    def _qc_decision_saved(self,record_id,decision):
+        shown='NEEDS RERUN' if decision=='RERUN' else decision
+        self.qc_message.setText(f'{record_id} saved as {shown}.')
+
+    def _qc_decision_failed(self,record_id,decision,message):
+        self.qc_message.setText(f'WARNING: {record_id} changed locally but was not saved to Firebird: {message}. Use Refresh QC after reconnecting.')
+        QMessageBox.warning(self,'QC save failed',f'{record_id} was not saved to Firebird.\n\n{message}\n\nThe table will be reconciled by Refresh QC.')
+
+    def _cleanup_qc_decision(self,record_id):
+        pair=self.qc_decision_threads.pop(record_id,None)
+        if pair:
+            thread,worker=pair;worker.deleteLater();thread.deleteLater()
 
     def _download_remote(self,remote_path,local_name):
         destination=Path.home()/"Downloads"/"IDtracker_Results"/local_name;destination.parent.mkdir(parents=True,exist_ok=True)
@@ -1497,17 +1705,28 @@ class Window(QMainWindow):
     def view_selected_qc_files(self):
         rec=self.selected_qc()
         if not rec:return
+        if self._open_cached_qc(rec):
+            self.qc_message.setText(f'Opened cached PDF for {rec["record_id"]}.')
+            self.prefetch_upcoming_qc(8)
+            return
+        self.qc_message.setText(f'PDF for {rec["record_id"]} is not cached yet; downloading it now…')
         try:
-            dest=self._download_qc_bundle(rec)
-            subprocess.run(['open',str(dest)],check=True)
+            dest=self._download_qc_bundle(rec);self.qc_cache[rec['record_id']]=str(dest)
             pdfs=sorted(dest.glob('*_tracks.pdf'))
-            if pdfs: subprocess.run(['open',str(pdfs[0])],check=False)
+            if pdfs: subprocess.Popen(['open',str(pdfs[0])])
+            else: subprocess.Popen(['open',str(dest)])
             self.qc_message.setText(f'Opened QC files for {rec["record_id"]}: {dest}')
+            self.prefetch_upcoming_qc(8)
         except Exception as exc:QMessageBox.critical(self,'View files failed',str(exc))
 
     def download_master_spreadsheets(self):
         try:
-            remote=self.project_root.text().rstrip('/')+'/QC/master_summaries';dest=self._download_remote(remote,'Master_Summaries');QMessageBox.information(self,'Download complete',f'Master spreadsheets downloaded to:\n{dest}')
+            python_path="$HOME/miniconda3/envs/beetle_pipeline/bin/python"
+            manager=self.repo_root.text().rstrip('/')+'/collector/qc_manager.py'
+            cmd=f"{python_path} {shlex.quote(manager)} --project-root {shlex.quote(self.project_root.text())} --rebuild"
+            self.qc_message.setText('Rebuilding master spreadsheets from current approvals…')
+            self.ssh().run(cmd,timeout=600,retries=0)
+            remote=self.project_root.text().rstrip('/')+'/QC/master_summaries';dest=self._download_remote(remote,'Master_Summaries');QMessageBox.information(self,'Download complete',f'Master spreadsheets rebuilt and downloaded to:\n{dest}')
         except Exception as exc:QMessageBox.critical(self,'Download failed',str(exc))
 
     def ssh(self):

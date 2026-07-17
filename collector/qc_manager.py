@@ -56,6 +56,11 @@ def annotate_run_summaries(run_dir, record_id, decision, notes):
 
 def rebuild(root):
  qc=root/'QC'; rows=[normalize_qc_row(r) for r in read(qc/'run_status.csv')]; outdir=qc/'master_summaries';outdir.mkdir(parents=True,exist_ok=True)
+ # Fast QC decisions defer per-run summary annotation. Rebuilding masters is the
+ # synchronization point that applies the final QC metadata to all approved runs.
+ for rec in rows:
+  if rec.get('qc_decision') in ('APPROVED','DONE'):
+   annotate_run_summaries(rec.get('run_dir',''),rec.get('record_id',''),rec.get('qc_decision','APPROVED'),rec.get('notes',''))
  counts={}
  for analysis,filename,candidates in [
   ('fight','master_fight_individual_summaries.csv',['combat_individual_summary_all.csv','fight_individuals_all.csv']),
@@ -77,7 +82,7 @@ def rebuild(root):
 def same_subject(a,b):
  return all((a.get(k,'') or '').strip()==(b.get(k,'') or '').strip() for k in ('video','cell','analysis'))
 
-def set_status(root,rid,decision,notes=''):
+def set_status(root,rid,decision,notes='',fast=False):
  decision=normalize_decision(decision); path=root/'QC'/'run_status.csv';rows=[normalize_qc_row(r) for r in read(path)]
  target=next((r for r in rows if r.get('record_id')==rid),None)
  if target is None:raise SystemExit(f'Unknown record ID: {rid}')
@@ -90,8 +95,13 @@ def set_status(root,rid,decision,notes=''):
   for old in candidates:
    old['qc_decision']='SUPERSEDED';old['replaced_by']=rid;superseded.append(old['record_id'])
   if superseded: target['replaces']=';'.join(superseded)
- write(path,rows); annotated=annotate_run_summaries(target.get('run_dir',''),rid,decision,target.get('notes','')); counts=rebuild(root)
- return {'decision':decision,'record_id':rid,'notes':target.get('notes',''),'summaries_annotated':annotated,'superseded':superseded,'masters':counts}
+ write(path,rows)
+ annotated=0
+ counts={}
+ if not fast:
+  annotated=annotate_run_summaries(target.get('run_dir',''),rid,decision,target.get('notes',''))
+  counts=rebuild(root)
+ return {'decision':decision,'record_id':rid,'notes':target.get('notes',''),'summaries_annotated':annotated,'superseded':superseded,'masters':counts,'fast':bool(fast)}
 
 def migrate_index(root):
  path=root/'QC'/'run_status.csv';rows=[normalize_qc_row(r) for r in read(path)]
@@ -99,8 +109,8 @@ def migrate_index(root):
  return {'migrated_rows':len(rows),'path':str(path)}
 
 def main():
- p=argparse.ArgumentParser();p.add_argument('--project-root',required=True);p.add_argument('--record-id');p.add_argument('--decision',choices=sorted(VALID_DECISIONS));p.add_argument('--notes',default=None);p.add_argument('--rebuild',action='store_true');p.add_argument('--migrate-index',action='store_true');a=p.parse_args();root=Path(a.project_root)
+ p=argparse.ArgumentParser();p.add_argument('--project-root',required=True);p.add_argument('--record-id');p.add_argument('--decision',choices=sorted(VALID_DECISIONS));p.add_argument('--notes',default=None);p.add_argument('--fast',action='store_true');p.add_argument('--rebuild',action='store_true');p.add_argument('--migrate-index',action='store_true');a=p.parse_args();root=Path(a.project_root)
  if a.migrate_index: print(migrate_index(root))
  elif a.rebuild: print(rebuild(root))
- else: print(set_status(root,a.record_id,a.decision,a.notes))
+ else: print(set_status(root,a.record_id,a.decision,a.notes,fast=a.fast))
 if __name__=='__main__':main()
