@@ -8,6 +8,10 @@ import time
 import shlex
 import subprocess
 import sys
+import os
+import tempfile
+import uuid
+import base64
 from datetime import datetime
 from pathlib import Path
 
@@ -28,6 +32,7 @@ from PyQt5.QtWidgets import (
 )
 import tomlkit
 from app.approval_matching import approval_key, apply_qc_statuses, normalize_qc_status
+from app.qc_rerun_matching import build_rerun_comparisons, attempt_number
 
 
 BASE = REPO_ROOT
@@ -36,33 +41,100 @@ DEFAULT = BASE / "config/default.json"
 
 
 class SSH:
-    def __init__(self, host, key):
+    """Short-fail, multiplexed SSH transport for unreliable networks."""
+    def __init__(self, host, key, *, connect_timeout=12, command_timeout=90):
         self.host = host
         self.key = str(Path(key).expanduser())
+        self.connect_timeout = int(connect_timeout)
+        self.command_timeout = int(command_timeout)
+        token = uuid.uuid4().hex[:10]
+        self.control_path = str(Path(tempfile.gettempdir()) / f"beetle_ssh_{os.getpid()}_{token}")
+        self._master_started = False
 
     def command(self):
         return [
-            "ssh", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
+            "ssh",
+            "-o", "BatchMode=yes",
+            "-o", "IdentitiesOnly=yes",
+            "-o", f"ConnectTimeout={self.connect_timeout}",
+            "-o", "ConnectionAttempts=1",
+            "-o", "ServerAliveInterval=5",
+            "-o", "ServerAliveCountMax=2",
+            "-o", "TCPKeepAlive=yes",
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPersist=120",
+            "-o", f"ControlPath={self.control_path}",
             "-i", self.key, self.host
         ]
 
-    def run(self, command, input_text=None, timeout=900):
-        result = subprocess.run(
-            self.command() + ["bash", "-lc", shlex.quote(command)],
-            input=input_text, capture_output=True, text=True, timeout=timeout
+    def close(self):
+        if not self._master_started:
+            return
+        try:
+            subprocess.run(
+                self.command() + ["-O", "exit"],
+                capture_output=True, text=True, timeout=3
+            )
+        except Exception:
+            pass
+        self._master_started = False
+
+    def run(self, command, input_text=None, timeout=None, *, retries=2, retry_safe=True):
+        timeout = self.command_timeout if timeout is None else timeout
+        last = None
+        attempts = max(1, retries + 1 if retry_safe else 1)
+        for attempt in range(attempts):
+            try:
+                result = subprocess.run(
+                    self.command() + ["bash", "-lc", shlex.quote(command)],
+                    input=input_text, capture_output=True, text=True, timeout=timeout
+                )
+                self._master_started = True
+                if result.returncode == 0:
+                    return result.stdout
+                message = result.stderr.strip() or result.stdout.strip() or f"SSH exited {result.returncode}"
+                raise RuntimeError(message)
+            except subprocess.TimeoutExpired:
+                last = RuntimeError(
+                    f"Firebird did not respond within {timeout} seconds. "
+                    "The operation was stopped so the app remains usable."
+                )
+            except Exception as exc:
+                last = exc
+            if attempt + 1 < attempts:
+                time.sleep(min(1.5 * (2 ** attempt), 5.0))
+        raise last
+
+    def read(self, path, timeout=45):
+        return self.run(f"cat -- {shlex.quote(path)}", timeout=timeout)
+
+    def read_many(self, paths, *, batch_size=100, timeout=120):
+        """Read remote text files in batches, requiring one SSH call per batch."""
+        result = {}
+        remote = "python -c " + shlex.quote(
+            "import base64,json,sys; paths=json.loads(sys.stdin.read()); out={}; "
+            "[(out.update({p: {'ok': True, 'data': base64.b64encode(open(p,'rb').read()).decode('ascii')}}) "
+            "if Path(p).is_file() else out.update({p: {'ok': False, 'error': 'missing'}})) for p in paths]; "
+            "print(json.dumps(out))"
         )
-        if result.returncode:
-            raise RuntimeError(result.stderr.strip() or result.stdout.strip())
-        return result.stdout
+        # Path is imported by the remote snippet for readability and portability.
+        remote = remote.replace("import base64,json,sys;", "import base64,json,sys; from pathlib import Path;")
+        for offset in range(0, len(paths), batch_size):
+            batch = paths[offset:offset + batch_size]
+            raw = self.run(remote, input_text=json.dumps(batch), timeout=timeout)
+            decoded = json.loads(raw or '{}')
+            for path, item in decoded.items():
+                if item.get('ok'):
+                    result[path] = base64.b64decode(item['data']).decode('utf-8', errors='replace')
+                else:
+                    result[path] = None
+        return result
 
-    def read(self, path):
-        return self.run(f"cat -- {shlex.quote(path)}")
-
-    def write(self, path, text):
+    def write(self, path, text, timeout=60):
         parent = str(Path(path).parent)
         self.run(
             f"mkdir -p {shlex.quote(parent)} && cat > {shlex.quote(path)}",
-            input_text=text,
+            input_text=text, timeout=timeout,
         )
 
 
@@ -419,6 +491,8 @@ class IndexWorker(QObject):
 
             rows = []
             total = len(toml_paths)
+            self.progress.emit(f"Downloading {total:,} TOMLs in network-efficient batches...")
+            toml_sources = ssh.read_many(toml_paths, batch_size=100, timeout=180)
 
             for number, toml_path in enumerate(toml_paths, start=1):
                 if self._cancelled:
@@ -431,7 +505,9 @@ class IndexWorker(QObject):
                     )
 
                 try:
-                    source = ssh.read(toml_path)
+                    source = toml_sources.get(toml_path)
+                    if source is None:
+                        raise RuntimeError("TOML could not be read from Firebird")
                     doc = tomlkit.parse(source)
 
                     embedded_name = None
@@ -562,6 +638,8 @@ class IndexWorker(QObject):
         finally:
             if index is not None:
                 index.close()
+            if 'ssh' in locals():
+                ssh.close()
 
 
 
@@ -611,6 +689,9 @@ class SubmitWorker(QObject):
         try:
             ssh = SSH(self.host, self.key)
             total = len(self.selected_rows)
+            toml_paths = list(dict.fromkeys(payload["row"]["toml"] for payload in self.selected_rows))
+            self.progress.emit(f"Loading {len(toml_paths):,} selected TOML(s) in batches...")
+            toml_sources = ssh.read_many(toml_paths, batch_size=100, timeout=180)
             for position, payload in enumerate(self.selected_rows, 1):
                 row = payload["row"]
                 analysis = payload["analysis"]
@@ -639,7 +720,9 @@ class SubmitWorker(QObject):
                     metadata_path = run_dir + "/run_metadata.json"
                     ssh.run(f"mkdir -p {shlex.quote(input_dir)} {shlex.quote(session_out)}")
                     self.progress.emit(f"Reading TOML for {label}...")
-                    source = ssh.read(row["toml"])
+                    source = toml_sources.get(row["toml"])
+                    if source is None:
+                        raise RuntimeError("TOML could not be read from Firebird")
                     doc = tomlkit.parse(source)
                     toml_analysis_start = extract_analysis_start_frame(doc)
                     effective_parameters = dict(self.parameters)
@@ -710,7 +793,7 @@ class SubmitWorker(QObject):
                     exports = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env.items())
                     command = f"export {exports}; bash {shlex.quote(self.repo_root + '/scripts/firebird/submit_pipeline_run.sh')}"
                     self.progress.emit(f"Submitting SLURM jobs for {label}...")
-                    result = ssh.run(command)
+                    result = ssh.run(command, timeout=60, retries=0, retry_safe=False)
                     job_ids = {"IDTRACKER_JOB": "", "POSTPROCESS_JOB": "", "COLLECTOR_JOB": ""}
                     for output_line in result.splitlines():
                         if "=" in output_line:
@@ -736,6 +819,9 @@ class SubmitWorker(QObject):
             self.finished.emit(messages)
         except Exception as exc:
             self.failed.emit(str(exc))
+        finally:
+            if 'ssh' in locals():
+                ssh.close()
 
 class RecoveryWorker(QObject):
     finished = pyqtSignal(list)
@@ -759,6 +845,62 @@ class RecoveryWorker(QObject):
             self.finished.emit(json.loads(output or '[]'))
         except Exception as exc:
             self.failed.emit(str(exc))
+        finally:
+            if 'ssh' in locals():
+                ssh.close()
+
+
+class RemoteCommandWorker(QObject):
+    finished = pyqtSignal(str)
+    failed = pyqtSignal(str)
+
+    def __init__(self, host, key, command, timeout=45):
+        super().__init__()
+        self.host = host; self.key = key; self.command = command; self.timeout = timeout
+
+    def run(self):
+        try:
+            ssh = SSH(self.host, self.key, connect_timeout=8, command_timeout=self.timeout)
+            self.finished.emit(ssh.run(self.command, timeout=self.timeout, retries=0))
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if 'ssh' in locals(): ssh.close()
+
+
+class JobStatesWorker(QObject):
+    finished = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, host, key, jobs):
+        super().__init__()
+        self.host = host; self.key = key; self.jobs = list(jobs)
+
+    def run(self):
+        try:
+            all_ids=[]
+            for job in self.jobs:
+                all_ids.extend([x for x in (job.get('idtracker_job',''), job.get('postprocess_job',''), job.get('collector_job','')) if x])
+            all_ids=list(dict.fromkeys(all_ids))
+            if not all_ids:
+                self.finished.emit({})
+                return
+            joined=','.join(all_ids)
+            cmd=(f"squeue -h -j {shlex.quote(joined)} -o '%i|%T|%R'; "
+                 f"sacct -n -X -P -j {shlex.quote(joined)} --format=JobIDRaw,State,ExitCode,Elapsed")
+            ssh=SSH(self.host,self.key,connect_timeout=8,command_timeout=35)
+            output=ssh.run(cmd,timeout=35,retries=0)
+            states={}
+            for line in output.splitlines():
+                if '|' not in line: continue
+                f=line.split('|')
+                if len(f)>=2 and f[0] in all_ids:
+                    states.setdefault(f[0],[]).append(f[1])
+            self.finished.emit({k: ','.join(dict.fromkeys(v)) for k,v in states.items()})
+        except Exception as exc:
+            self.failed.emit(str(exc))
+        finally:
+            if 'ssh' in locals(): ssh.close()
 
 
 class Window(QMainWindow):
@@ -773,6 +915,10 @@ class Window(QMainWindow):
         self.index_worker = None
         self.recovery_thread = None
         self.recovery_worker = None
+        self.remote_thread = None
+        self.remote_worker = None
+        self.job_states_thread = None
+        self.job_states_worker = None
         self.index_db_path = str(
             Path.home() / '.beetle_idtracker' / 'firebird_index.sqlite3'
         )
@@ -787,7 +933,7 @@ class Window(QMainWindow):
         tabs.addTab(self.diagnostics_page(), "5. Jobs and Diagnostics")
         tabs.addTab(self.qc_page(), "6. QC and Masters")
         self.setCentralWidget(tabs)
-        QTimer.singleShot(800, self.recover_runs)
+        # Remote recovery is explicit so opening the Jobs tab never initiates network I/O.
 
     def connection_page(self):
         page = QWidget()
@@ -967,6 +1113,22 @@ class Window(QMainWindow):
         explanation.setWordWrap(True)
         layout.addWidget(explanation)
 
+        filters = QHBoxLayout()
+        filters.addWidget(QLabel("Search jobs:"))
+        self.jobs_filter = QLineEdit()
+        self.jobs_filter.setPlaceholderText("Search video, cell, job ID, status, date, or run folder")
+        self.jobs_filter.textChanged.connect(self.apply_jobs_filter)
+        filters.addWidget(self.jobs_filter, 1)
+        filters.addWidget(QLabel("Status:"))
+        self.jobs_status_filter = QComboBox()
+        self.jobs_status_filter.addItems(["All statuses", "Pending/running", "Completed", "Failed", "Submitted", "Unknown/error", "No jobs"])
+        self.jobs_status_filter.currentTextChanged.connect(self.apply_jobs_filter)
+        filters.addWidget(self.jobs_status_filter)
+        clear_jobs = QPushButton("Clear Filter")
+        clear_jobs.clicked.connect(lambda: (self.jobs_filter.clear(), self.jobs_status_filter.setCurrentIndex(0)))
+        filters.addWidget(clear_jobs)
+        layout.addLayout(filters)
+
         self.jobs_table = QTableWidget(0, 8)
         self.jobs_table.setHorizontalHeaderLabels([
             "Attempt", "Date/time", "Video/cell", "IDtracker job",
@@ -979,9 +1141,6 @@ class Window(QMainWindow):
         )
         self.jobs_table.horizontalHeader().setSectionResizeMode(
             7, QHeaderView.Stretch
-        )
-        self.jobs_table.itemSelectionChanged.connect(
-            self.retrieve_selected_diagnostics
         )
         layout.addWidget(self.jobs_table, 3)
 
@@ -1028,17 +1187,18 @@ class Window(QMainWindow):
 
     def qc_page(self):
         page=QWidget();layout=QVBoxLayout(page)
-        note=QLabel("Review completed runs. APPROVED adds a run to the appropriate master spreadsheet. NEEDS RERUN and RERUNNING remain excluded. When a newer replacement is approved, older matching rerun records are automatically marked SUPERSEDED.");note.setWordWrap(True);layout.addWidget(note)
+        note=QLabel("Review completed runs. Use Rerun comparison mode to place every NEEDS RERUN or RERUNNING record directly beside later attempts of the same video, cell, and analysis. Review both before manually marking the older record SUPERSEDED.");note.setWordWrap(True);layout.addWidget(note)
 
         filters=QHBoxLayout();filters.addWidget(QLabel("Search/filter:"))
-        self.qc_filter=QLineEdit();self.qc_filter.setPlaceholderText("Type any part of a record ID, date, camera/video name, cell, or status")
+        self.qc_filter=QLineEdit();self.qc_filter.setPlaceholderText("Search record ID, date, video, cell, status, notes, attempt, or comparison result")
         self.qc_filter.textChanged.connect(self.apply_qc_filter);filters.addWidget(self.qc_filter,1)
         self.qc_status_filter=QComboBox();self.qc_status_filter.addItems(["All statuses","PENDING","APPROVED","NEEDS RERUN","RERUNNING","SUPERSEDED"]);self.qc_status_filter.currentTextChanged.connect(self.apply_qc_filter);filters.addWidget(self.qc_status_filter)
-        clear=QPushButton("Clear Filter");clear.clicked.connect(lambda:(self.qc_filter.clear(),self.qc_status_filter.setCurrentIndex(0)));filters.addWidget(clear);layout.addLayout(filters)
+        self.qc_view_mode=QComboBox();self.qc_view_mode.addItems(["All QC records","Rerun comparisons","Flagged with later attempt","Flagged without later attempt","Ready to review for superseding"]);self.qc_view_mode.currentTextChanged.connect(self.rebuild_qc_table);filters.addWidget(self.qc_view_mode)
+        clear=QPushButton("Clear Filter");clear.clicked.connect(lambda:(self.qc_filter.clear(),self.qc_status_filter.setCurrentIndex(0),self.qc_view_mode.setCurrentIndex(0)));filters.addWidget(clear);layout.addLayout(filters)
 
-        self.qc_table=QTableWidget(0,11);self.qc_table.setHorizontalHeaderLabels(["Record ID","Date run","Analysis","Video / Camera","Cell","Pipeline","QC status","Replaces","Replaced by","Notes","Run folder"]);self.qc_table.setSelectionBehavior(QAbstractItemView.SelectRows);self.qc_table.setSortingEnabled(True);self.qc_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents);self.qc_table.horizontalHeader().setSectionResizeMode(9,QHeaderView.Stretch);self.qc_table.horizontalHeader().setSectionResizeMode(10,QHeaderView.Stretch);layout.addWidget(self.qc_table)
+        self.qc_table=QTableWidget(0,13);self.qc_table.setHorizontalHeaderLabels(["Comparison","Record ID","Date run","Analysis","Video / Camera","Cell","Attempt","Pipeline","QC status","Replaces","Replaced by","Notes","Run folder"]);self.qc_table.setSelectionBehavior(QAbstractItemView.SelectRows);self.qc_table.setSortingEnabled(True);self.qc_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents);self.qc_table.horizontalHeader().setSectionResizeMode(11,QHeaderView.Stretch);self.qc_table.horizontalHeader().setSectionResizeMode(12,QHeaderView.Stretch);layout.addWidget(self.qc_table)
         row=QHBoxLayout()
-        for label,fn in [("Refresh QC",self.refresh_qc),("Save Notes",self.save_qc_notes),("Approve",lambda:self.set_qc_decision('APPROVED')),("Needs Rerun",lambda:self.set_qc_decision('RERUN')),("Mark Rerunning",lambda:self.set_qc_decision('RERUNNING')),("Mark Superseded",lambda:self.set_qc_decision('SUPERSEDED')),("Mark Pending",lambda:self.set_qc_decision('PENDING')),("Download Selected",self.download_selected_qc),("View Files",self.view_selected_qc_files),("Download Masters",self.download_master_spreadsheets)]:
+        for label,fn in [("Refresh QC",self.refresh_qc),("Show Rerun Comparisons",lambda:self.qc_view_mode.setCurrentText("Rerun comparisons")),("Save Notes",self.save_qc_notes),("Approve",lambda:self.set_qc_decision('APPROVED')),("Needs Rerun",lambda:self.set_qc_decision('RERUN')),("Mark Rerunning",lambda:self.set_qc_decision('RERUNNING')),("Mark Superseded",lambda:self.set_qc_decision('SUPERSEDED')),("Mark Pending",lambda:self.set_qc_decision('PENDING')),("Download Selected",self.download_selected_qc),("View Files",self.view_selected_qc_files),("Download Masters",self.download_master_spreadsheets)]:
             b=QPushButton(label);b.clicked.connect(fn);row.addWidget(b)
         layout.addLayout(row);self.qc_message=QLabel('');self.qc_message.setWordWrap(True);layout.addWidget(self.qc_message);return page
 
@@ -1046,18 +1206,44 @@ class Window(QMainWindow):
         try:
             text=self.ssh().run(f"cat {shlex.quote(self.project_root.text().rstrip('/')+'/QC/run_status.csv')} 2>/dev/null || true")
             import csv,io
-            rows=list(csv.DictReader(io.StringIO(text))) if text.strip() else []
-            self.qc_rows=rows;self.qc_table.setSortingEnabled(False);self.qc_table.setRowCount(len(rows))
-            labels={'DONE':'APPROVED','RERUN':'NEEDS RERUN'}
-            for i,r in enumerate(rows):
-                status=labels.get((r.get('qc_decision') or 'PENDING').upper(),(r.get('qc_decision') or 'PENDING').upper())
-                vals=[r.get('record_id',''),r.get('date_run',''),r.get('analysis',''),r.get('video',''),r.get('cell',''),r.get('pipeline_status',''),status,r.get('replaces',''),r.get('replaced_by',''),r.get('notes',''),r.get('run_dir','')]
-                for c,v in enumerate(vals):
-                    item=QTableWidgetItem(str(v));item.setData(Qt.UserRole,r)
-                    if c != 9: item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                    self.qc_table.setItem(i,c,item)
-            self.qc_table.setSortingEnabled(True);self.apply_qc_filter();self.qc_message.setText(f"Loaded {len(rows)} collected runs.")
+            self.qc_rows=list(csv.DictReader(io.StringIO(text))) if text.strip() else []
+            self.rebuild_qc_table()
+            self.qc_message.setText(f"Loaded {len(self.qc_rows)} collected runs. Rerun comparison mode found {len(build_rerun_comparisons(self.qc_rows))} comparison rows.")
         except Exception as exc: QMessageBox.critical(self,'QC refresh failed',str(exc))
+
+    def _qc_display_rows(self):
+        rows=list(getattr(self,'qc_rows',[]) or [])
+        mode=self.qc_view_mode.currentText() if hasattr(self,'qc_view_mode') else 'All QC records'
+        if mode=='All QC records':
+            return rows
+        comparisons=build_rerun_comparisons(rows)
+        if mode=='Rerun comparisons':
+            return comparisons
+        groups={}
+        for row in comparisons:groups.setdefault(row.get('_comparison_group',''),[]).append(row)
+        selected=[]
+        for group_rows in groups.values():
+            original=next((r for r in group_rows if r.get('_comparison_role')=='original'),None)
+            later=[r for r in group_rows if r.get('_comparison_role')=='later']
+            if mode=='Flagged with later attempt' and later:selected.extend(group_rows)
+            elif mode=='Flagged without later attempt' and not later:selected.extend(group_rows)
+            elif mode=='Ready to review for superseding' and any((r.get('_normalized_status')=='APPROVED' or str(r.get('pipeline_status') or '').upper() in {'COMPLETED','COLLECTED','DONE'}) for r in later):selected.extend(group_rows)
+        return selected
+
+    def rebuild_qc_table(self):
+        if not hasattr(self,'qc_table'):return
+        rows=self._qc_display_rows();self.qc_table.setSortingEnabled(False);self.qc_table.setRowCount(len(rows))
+        labels={'DONE':'APPROVED','RERUN':'NEEDS RERUN'}
+        for i,r in enumerate(rows):
+            status=labels.get((r.get('qc_decision') or 'PENDING').upper(),(r.get('qc_decision') or 'PENDING').upper())
+            group=r.get('_comparison_group','');comparison=r.get('_comparison_label','')
+            comparison_text=(f"{group}: {comparison}" if group else '')
+            vals=[comparison_text,r.get('record_id',''),r.get('date_run',''),r.get('analysis',''),r.get('video',''),r.get('cell',''),attempt_number(r) or '',r.get('pipeline_status',''),status,r.get('replaces',''),r.get('replaced_by',''),r.get('notes',''),r.get('run_dir','')]
+            for c,v in enumerate(vals):
+                item=QTableWidgetItem(str(v));item.setData(Qt.UserRole,r)
+                if c != 11:item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                self.qc_table.setItem(i,c,item)
+        self.qc_table.setSortingEnabled(True);self.apply_qc_filter()
 
     def apply_qc_filter(self):
         if not hasattr(self,'qc_table'): return
@@ -1065,18 +1251,18 @@ class Window(QMainWindow):
         selected=(self.qc_status_filter.currentText() if hasattr(self,'qc_status_filter') else 'All statuses').upper()
         for row in range(self.qc_table.rowCount()):
             hay=' '.join((self.qc_table.item(row,c).text() if self.qc_table.item(row,c) else '') for c in range(self.qc_table.columnCount())).lower()
-            status=(self.qc_table.item(row,6).text() if self.qc_table.item(row,6) else '').upper()
+            status=(self.qc_table.item(row,8).text() if self.qc_table.item(row,8) else '').upper()
             visible=(not needle or needle in hay) and (selected=='ALL STATUSES' or status==selected)
             self.qc_table.setRowHidden(row,not visible)
 
     def selected_qc(self):
         rows=self.qc_table.selectionModel().selectedRows() if hasattr(self,'qc_table') else []
-        return self.qc_table.item(rows[0].row(),0).data(Qt.UserRole) if rows else None
+        return self.qc_table.item(rows[0].row(),1).data(Qt.UserRole) if rows else None
 
     def _selected_qc_note(self):
         rows=self.qc_table.selectionModel().selectedRows() if hasattr(self,'qc_table') else []
         if not rows:return ''
-        item=self.qc_table.item(rows[0].row(),9)
+        item=self.qc_table.item(rows[0].row(),11)
         return item.text().strip() if item else ''
 
     def save_qc_notes(self):
@@ -1431,25 +1617,51 @@ class Window(QMainWindow):
 
 
 
+    def _job_matches_status(self, status, selected):
+        s=(status or '').upper()
+        if selected == "All statuses": return True
+        if selected == "Pending/running": return any(x in s for x in ("PENDING","RUNNING","CONFIGURING","COMPLETING"))
+        if selected == "Completed": return "COMPLETED" in s or "COLLECTED" in s or "APPROVED" in s
+        if selected == "Failed": return any(x in s for x in ("FAILED","CANCELLED","TIMEOUT","OUT_OF_MEMORY","NODE_FAIL"))
+        if selected == "Submitted": return "SUBMITTED" in s
+        if selected == "Unknown/error": return "UNKNOWN" in s or "ERROR" in s or "DISCONNECT" in s
+        if selected == "No jobs": return "NO JOBS" in s
+        return True
+
+    def apply_jobs_filter(self):
+        if not hasattr(self, 'jobs_table'): return
+        needle=self.jobs_filter.text().strip().lower() if hasattr(self,'jobs_filter') else ''
+        selected=self.jobs_status_filter.currentText() if hasattr(self,'jobs_status_filter') else 'All statuses'
+        for r in range(self.jobs_table.rowCount()):
+            text=' '.join(self.jobs_table.item(r,c).text() if self.jobs_table.item(r,c) else '' for c in range(self.jobs_table.columnCount())).lower()
+            status=self.jobs_table.item(r,6).text() if self.jobs_table.item(r,6) else ''
+            self.jobs_table.setRowHidden(r, not ((not needle or needle in text) and self._job_matches_status(status,selected)))
+
     def populate_jobs_table(self):
         if not hasattr(self, "jobs_table"):
             return
-        self.jobs_table.setRowCount(len(self.jobs))
-        for row_number, job in enumerate(self.jobs):
-            values = [
-                f"{int(job.get('attempt_index', job.get('run_index', 1))):05d}",
-                job["timestamp"],
-                job["label"],
-                job.get("idtracker_job", ""),
-                job.get("postprocess_job", ""),
-                job.get("collector_job", ""),
-                job.get("status", "Submitted"),
-                job["run_dir"],
-            ]
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(str(value))
-                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
-                self.jobs_table.setItem(row_number, column, item)
+        self.jobs_table.setUpdatesEnabled(False)
+        try:
+            self.jobs_table.setRowCount(len(self.jobs))
+            for row_number, job in enumerate(self.jobs):
+                values = [
+                    f"{int(job.get('attempt_index', job.get('run_index', 1))):05d}",
+                    job.get("timestamp", ""),
+                    job.get("label", ""),
+                    job.get("idtracker_job", ""),
+                    job.get("postprocess_job", ""),
+                    job.get("collector_job", ""),
+                    job.get("status", "Submitted"),
+                    job.get("run_dir", ""),
+                ]
+                for column, value in enumerate(values):
+                    item = QTableWidgetItem(str(value))
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                    if column == 0: item.setData(Qt.UserRole, job.get('run_dir',''))
+                    self.jobs_table.setItem(row_number, column, item)
+        finally:
+            self.jobs_table.setUpdatesEnabled(True)
+        self.apply_jobs_filter()
 
 
     def recover_runs(self):
@@ -1502,127 +1714,145 @@ class Window(QMainWindow):
         if not rows:
             return None
         index = rows[0].row()
-        if not 0 <= index < len(self.jobs):
-            return None
-        return self.jobs[index]
+        item = self.jobs_table.item(index, 0)
+        run_dir = item.data(Qt.UserRole) if item else None
+        for job in self.jobs:
+            if job.get('run_dir') == run_dir:
+                return job
+        return None
+
+    def _run_remote_for_output(self, command, busy_text, timeout=45):
+        if self.remote_thread is not None:
+            self.diagnostics_output.setPlainText(
+                "A Firebird request is already running. You may continue using and filtering the table."
+            )
+            return
+        self.diagnostics_output.setPlainText(
+            busy_text + "\n\nThis runs in the background and will stop quickly if the VPN is unavailable."
+        )
+        self.remote_thread = QThread(self)
+        self.remote_worker = RemoteCommandWorker(
+            self.host.text().strip(), self.key.text().strip(), command, timeout
+        )
+        self.remote_worker.moveToThread(self.remote_thread)
+        self.remote_thread.started.connect(self.remote_worker.run)
+        self.remote_worker.finished.connect(self.diagnostics_output.setPlainText)
+        self.remote_worker.failed.connect(
+            lambda m: self.diagnostics_output.setPlainText(
+                "Firebird request failed or disconnected:\n" + m
+            )
+        )
+        self.remote_worker.finished.connect(self.remote_thread.quit)
+        self.remote_worker.failed.connect(self.remote_thread.quit)
+        self.remote_thread.finished.connect(self._cleanup_remote_thread)
+        self.remote_thread.start()
+
+    def _cleanup_remote_thread(self):
+        if self.remote_worker is not None:
+            self.remote_worker.deleteLater()
+        if self.remote_thread is not None:
+            self.remote_thread.deleteLater()
+        self.remote_worker = None
+        self.remote_thread = None
 
     def retrieve_selected_diagnostics(self):
         job = self.selected_job()
         if job is None:
             return
-        try:
-            script = (
-                self.repo_root.text().rstrip("/")
-                + "/scripts/firebird/diagnose_pipeline_run.sh"
-            )
-            command = (
-                f"bash {shlex.quote(script)} "
-                f"{shlex.quote(job['run_dir'])}"
-            )
-            output = self.ssh().run(command, timeout=300)
-            self.diagnostics_output.setPlainText(output)
-        except Exception as exc:
-            self.diagnostics_output.setPlainText(
-                f"Could not retrieve diagnostics:\n{exc}"
-            )
+        script = self.repo_root.text().rstrip("/") + "/scripts/firebird/diagnose_pipeline_run.sh"
+        command = f"bash {shlex.quote(script)} {shlex.quote(job['run_dir'])}"
+        self._run_remote_for_output(command, "Retrieving diagnostics…", 45)
 
     def fetch_selected_logs(self):
         job = self.selected_job()
         if job is None:
-            QMessageBox.warning(
-                self, "Select a run", "Select a run in the table first."
-            )
+            QMessageBox.warning(self, "Select a run", "Select a run in the table first.")
             return
-        try:
-            run_dir = job["run_dir"]
-            command = (
-                f"if [[ -d {shlex.quote(run_dir + '/logs')} ]]; then "
-                f"for f in {shlex.quote(run_dir + '/logs')}/*.out "
-                f"{shlex.quote(run_dir + '/logs')}/*.err; do "
-                f"[[ -f \"$f\" ]] || continue; "
-                f"echo; echo \"===== $f =====\"; tail -n 300 \"$f\"; done; "
-                "else echo 'No logs directory exists.'; fi"
-            )
-            self.diagnostics_output.setPlainText(
-                self.ssh().run(command, timeout=300)
-            )
-        except Exception as exc:
-            QMessageBox.critical(self, "Log retrieval failed", str(exc))
+        run_dir = job["run_dir"]
+        command = (
+            f"if [[ -d {shlex.quote(run_dir + '/logs')} ]]; then "
+            f"for f in {shlex.quote(run_dir + '/logs')}/*.out {shlex.quote(run_dir + '/logs')}/*.err; do "
+            "[[ -f \"$f\" ]] || continue; echo; echo \"===== $f =====\"; tail -n 300 \"$f\"; done; "
+            "else echo 'No logs directory exists.'; fi"
+        )
+        self._run_remote_for_output(command, "Fetching logs…", 45)
 
     def check_selected_session(self):
         job = self.selected_job()
         if job is None:
-            QMessageBox.warning(
-                self, "Select a run", "Select a run in the table first."
-            )
+            QMessageBox.warning(self, "Select a run", "Select a run in the table first.")
             return
-        try:
-            run_dir = job["run_dir"]
-            command = (
-                f"echo 'Run: {shlex.quote(run_dir)}'; "
-                f"if [[ -f {shlex.quote(run_dir + '/session_path.txt')} ]]; then "
-                f"echo 'Recorded session:'; "
-                f"cat {shlex.quote(run_dir + '/session_path.txt')}; "
-                f"session=$(cat {shlex.quote(run_dir + '/session_path.txt')}); "
-                f"echo; echo 'Session files:'; "
-                f"find \"$session\" -maxdepth 4 -type f "
-                r"\( -name 'trajectories*.npy' -o -name 'trajectories*.h5' "
-                r"-o -name 'session.json' -o -name 'attributes.json' \) "
-                r"-printf '%TY-%Tm-%Td %TH:%TM:%TS\t%p\n' 2>/dev/null | sort; "
-                f"else echo 'session_path.txt is missing'; fi; "
-                f"echo; echo 'All session_* directories under run:'; "
-                f"find {shlex.quote(run_dir)} -type d -name 'session_*' "
-                r"-printf '%TY-%Tm-%Td %TH:%TM:%TS\t%p\n' 2>/dev/null "
-                "| sort -r | head -30"
-            )
-            self.diagnostics_output.setPlainText(
-                self.ssh().run(command, timeout=300)
-            )
-        except Exception as exc:
-            QMessageBox.critical(
-                self, "Session check failed", str(exc)
-            )
+        run_dir = job["run_dir"]
+        command = (
+            f"echo 'Run: {shlex.quote(run_dir)}'; "
+            f"if [[ -f {shlex.quote(run_dir + '/session_path.txt')} ]]; then "
+            f"echo 'Recorded session:'; cat {shlex.quote(run_dir + '/session_path.txt')}; "
+            f"session=$(cat {shlex.quote(run_dir + '/session_path.txt')}); "
+            "echo; echo 'Session files:'; "
+            "find \"$session\" -maxdepth 4 -type f "
+            "\\( -name 'trajectories*.npy' -o -name 'trajectories*.h5' -o -name 'session.json' -o -name 'attributes.json' \\) "
+            "-print 2>/dev/null | sort; "
+            "else echo 'session_path.txt is missing'; fi; "
+            f"echo; find {shlex.quote(run_dir)} -type d -name 'session_*' -print 2>/dev/null | head -30"
+        )
+        self._run_remote_for_output(command, "Checking session discovery…", 45)
 
     def refresh_all_job_states(self):
         if not self.jobs:
-            QMessageBox.information(
-                self, "No jobs", "No runs have been submitted in this session."
-            )
+            QMessageBox.information(self, "No jobs", "No runs are currently listed.")
             return
+        if self.job_states_thread is not None:
+            self.diagnostics_output.setPlainText("A job-state refresh is already running.")
+            return
+        self.diagnostics_output.setPlainText(
+            "Refreshing all job states in one background Firebird request…"
+        )
+        self.job_states_thread = QThread(self)
+        self.job_states_worker = JobStatesWorker(
+            self.host.text().strip(), self.key.text().strip(), self.jobs
+        )
+        self.job_states_worker.moveToThread(self.job_states_thread)
+        self.job_states_thread.started.connect(self.job_states_worker.run)
+        self.job_states_worker.finished.connect(self._job_states_finished)
+        self.job_states_worker.failed.connect(self._job_states_failed)
+        self.job_states_worker.finished.connect(self.job_states_thread.quit)
+        self.job_states_worker.failed.connect(self.job_states_thread.quit)
+        self.job_states_thread.finished.connect(self._cleanup_job_states_thread)
+        self.job_states_thread.start()
 
+    def _job_states_finished(self, states):
         for job in self.jobs:
             ids = [
-                job.get("idtracker_job", ""),
-                job.get("postprocess_job", ""),
-                job.get("collector_job", ""),
+                x for x in (
+                    job.get("idtracker_job", ""),
+                    job.get("postprocess_job", ""),
+                    job.get("collector_job", ""),
+                ) if x
             ]
-            ids = [job_id for job_id in ids if job_id]
             if not ids:
                 job["status"] = "No jobs"
                 continue
-
-            joined = ",".join(ids)
-            command = (
-                f"squeue -h -j {shlex.quote(joined)} -o '%i|%T|%R'; "
-                f"sacct -n -X -P -j {shlex.quote(joined)} "
-                "--format=JobIDRaw,State,ExitCode,Elapsed"
-            )
-            try:
-                output = self.ssh().run(command)
-                states = []
-                for line in output.splitlines():
-                    if "|" not in line:
-                        continue
-                    fields = line.split("|")
-                    if len(fields) >= 2 and fields[0] in ids:
-                        states.append(
-                            f"{fields[0]}:{fields[1]}"
-                        )
-                job["status"] = ", ".join(dict.fromkeys(states)) or "Unknown"
-            except Exception as exc:
-                job["status"] = f"Error: {exc}"
-
+            found = [f"{job_id}:{states[job_id]}" for job_id in ids if job_id in states]
+            job["status"] = ", ".join(found) if found else "Unknown (not in queue/accounting yet)"
         self.populate_jobs_table()
+        self.diagnostics_output.setPlainText(
+            "Job states refreshed. The Jobs table remained local and responsive during the request."
+        )
+
+    def _job_states_failed(self, message):
+        self.diagnostics_output.setPlainText(
+            "Could not refresh job states because Firebird disconnected or did not respond:\n"
+            + message
+            + "\n\nExisting locally cached rows were preserved."
+        )
+
+    def _cleanup_job_states_thread(self):
+        if self.job_states_worker is not None:
+            self.job_states_worker.deleteLater()
+        if self.job_states_thread is not None:
+            self.job_states_thread.deleteLater()
+        self.job_states_worker = None
+        self.job_states_thread = None
 
     def cancel_selected_blocked_jobs(self):
         job = self.selected_job()

@@ -1,4 +1,24 @@
+## 0.9.22 - QC rerun comparison workflow
+
+- Added local rerun comparison mode for NEEDS RERUN and RERUNNING records.
+- Groups later attempts from the same video, cell, and analysis directly below the flagged record.
+- Added filters for replacements found, no replacement, and ready-to-review superseding candidates.
+- Added attempt and comparison columns to the QC table.
+- Superseding remains a manual QC decision.
+
 # Changelog
+
+## 0.9.21 - Offline-safe Jobs tab and job filtering
+
+- Removed all automatic SSH activity triggered by opening the Jobs tab or selecting a row.
+- Disabled automatic startup recovery; recovery is now an explicit background action.
+- Moved diagnostics, log retrieval, session checks, and bulk job-state refresh into background workers.
+- Batched all job-state checks into one SSH request instead of one connection per run.
+- Added short connection and command timeouts so VPN failures return control quickly.
+- Preserves locally cached job rows and statuses after a disconnect.
+- Added full-text search across video/cell, job IDs, status, date, and remote run folder.
+- Added status filters for pending/running, completed, failed, submitted, unknown/error, and no-job records.
+- Filtering is entirely local and remains responsive without a VPN connection.
 
 ## 0.9.19 - Automatic recovery, attempt indexing, and analysis start frames
 
@@ -236,3 +256,11 @@
 - Notes are stored in `QC/run_status.csv`.
 - Saving a note or QC decision annotates BA and fight summary CSVs with `qc_record_id`, `qc_decision`, and `qc_notes`.
 - Approved BA and fight master summary files now include `qc_notes`.
+
+## 0.9.20 — Unreliable-network resilience
+- Added short SSH connection and command timeouts so a lost VPN cannot block the GUI indefinitely.
+- Added SSH keepalive detection, bounded retry/backoff, and connection multiplexing.
+- Reworked TOML indexing to download TOMLs in batches of 100 instead of opening one SSH command per TOML.
+- Reworked submission preparation to batch-load selected TOMLs and reuse one SSH connection.
+- Disabled automatic retry for the final SLURM submission command to avoid duplicate jobs after an ambiguous disconnect.
+- Added clearer timeout errors directing users to Recover Runs from Firebird after connectivity returns.
