@@ -35,6 +35,25 @@ def write(path,rows,fields=QC_FIELDS):
   w=csv.DictWriter(f,fieldnames=fields,extrasaction='ignore');w.writeheader();w.writerows(rows)
  tmp.replace(path)
 
+
+def annotate_run_summaries(run_dir, record_id, decision, notes):
+ outputs=Path(run_dir)/'outputs'
+ if not outputs.exists(): return 0
+ changed=0
+ for path in outputs.rglob('*.csv'):
+  name=path.name.lower()
+  if 'summary' not in name or 'dictionary' in name or 'manifest' in name or 'qc_review_bundle' in path.parts: continue
+  rows=read(path)
+  if not rows: continue
+  for row in rows:
+   row['qc_record_id']=record_id
+   row['qc_decision']='APPROVED' if decision=='DONE' else decision
+   row['qc_notes']=notes or ''
+  fields=list(rows[0].keys())
+  write(path,rows,fields)
+  changed+=1
+ return changed
+
 def rebuild(root):
  qc=root/'QC'; rows=[normalize_qc_row(r) for r in read(qc/'run_status.csv')]; outdir=qc/'master_summaries';outdir.mkdir(parents=True,exist_ok=True)
  counts={}
@@ -49,7 +68,7 @@ def rebuild(root):
     p=run/'outputs'/name
     if p.exists():src=p;break
    if not src:continue
-   for n,data in enumerate(read(src),1):combined.append({'qc_record_id':rec['record_id'],'qc_decision':'APPROVED','qc_source_file':str(src),'qc_source_row':n,**data})
+   for n,data in enumerate(read(src),1):combined.append({'qc_record_id':rec['record_id'],'qc_decision':'APPROVED','qc_notes':rec.get('notes',''),'qc_source_file':str(src),'qc_source_row':n,**data})
   target=outdir/filename
   write(target,combined,list(combined[0]) if combined else ['qc_record_id','qc_decision','qc_source_file','qc_source_row'])
   counts[analysis]=len(combined)
@@ -62,7 +81,7 @@ def set_status(root,rid,decision,notes=''):
  decision=normalize_decision(decision); path=root/'QC'/'run_status.csv';rows=[normalize_qc_row(r) for r in read(path)]
  target=next((r for r in rows if r.get('record_id')==rid),None)
  if target is None:raise SystemExit(f'Unknown record ID: {rid}')
- target['qc_decision']=decision;target['notes']=notes or target.get('notes','')
+ target['qc_decision']=decision;target['notes']=notes if notes is not None else target.get('notes','')
  superseded=[]
  # Approving a replacement automatically retires older bad/in-progress runs for the same video/cell/analysis.
  if decision in ('APPROVED','DONE'):
@@ -71,8 +90,8 @@ def set_status(root,rid,decision,notes=''):
   for old in candidates:
    old['qc_decision']='SUPERSEDED';old['replaced_by']=rid;superseded.append(old['record_id'])
   if superseded: target['replaces']=';'.join(superseded)
- write(path,rows); counts=rebuild(root)
- return {'decision':decision,'record_id':rid,'superseded':superseded,'masters':counts}
+ write(path,rows); annotated=annotate_run_summaries(target.get('run_dir',''),rid,decision,target.get('notes','')); counts=rebuild(root)
+ return {'decision':decision,'record_id':rid,'notes':target.get('notes',''),'summaries_annotated':annotated,'superseded':superseded,'masters':counts}
 
 def migrate_index(root):
  path=root/'QC'/'run_status.csv';rows=[normalize_qc_row(r) for r in read(path)]
@@ -80,7 +99,7 @@ def migrate_index(root):
  return {'migrated_rows':len(rows),'path':str(path)}
 
 def main():
- p=argparse.ArgumentParser();p.add_argument('--project-root',required=True);p.add_argument('--record-id');p.add_argument('--decision',choices=sorted(VALID_DECISIONS));p.add_argument('--notes',default='');p.add_argument('--rebuild',action='store_true');p.add_argument('--migrate-index',action='store_true');a=p.parse_args();root=Path(a.project_root)
+ p=argparse.ArgumentParser();p.add_argument('--project-root',required=True);p.add_argument('--record-id');p.add_argument('--decision',choices=sorted(VALID_DECISIONS));p.add_argument('--notes',default=None);p.add_argument('--rebuild',action='store_true');p.add_argument('--migrate-index',action='store_true');a=p.parse_args();root=Path(a.project_root)
  if a.migrate_index: print(migrate_index(root))
  elif a.rebuild: print(rebuild(root))
  else: print(set_status(root,a.record_id,a.decision,a.notes))

@@ -27,7 +27,7 @@ from PyQt5.QtWidgets import (
     QRadioButton, QButtonGroup
 )
 import tomlkit
-from app.approval_matching import approval_key, apply_approvals
+from app.approval_matching import approval_key, apply_qc_statuses, normalize_qc_status
 
 
 BASE = REPO_ROOT
@@ -323,31 +323,29 @@ class IndexWorker(QObject):
     def cancel(self):
         self._cancelled = True
 
-    def _load_approved_runs(self, ssh):
+    def _load_qc_statuses(self, ssh):
         if not self.project_root:
             return {}
         path = self.project_root + "/QC/run_status.csv"
         text = ssh.run(f"cat -- {shlex.quote(path)} 2>/dev/null || true")
-        approved = {}
+        qc_records = {}
         if not text.strip():
-            return approved
+            return qc_records
         for record in csv.DictReader(io.StringIO(text)):
-            decision = (record.get("qc_decision") or "").strip().upper()
-            if decision not in {"APPROVED", "DONE"}:
-                continue
+            record["qc_decision"] = normalize_qc_status(record.get("qc_decision"))
             key = approval_key(record.get("video"), record.get("cell"), record.get("analysis"))
-            rank = (record.get("date_run", ""), record.get("run_index", ""))
-            current = approved.get(key)
+            rank = (record.get("date_run", ""), record.get("run_index", ""), record.get("collected_at", ""))
+            current = qc_records.get(key)
             if current is None or rank >= current[0]:
-                approved[key] = (rank, record)
-        return {key: value[1] for key, value in approved.items()}
+                qc_records[key] = (rank, record)
+        return {key: value[1] for key, value in qc_records.items()}
 
     def run(self):
         index = None
         try:
             index = LocalIndex(self.db_path)
             ssh = SSH(self.host, self.key)
-            approved = self._load_approved_runs(ssh)
+            qc_records = self._load_qc_statuses(ssh)
 
             if not self.rebuild:
                 rows, summary = index.load(self.search_root)
@@ -357,7 +355,7 @@ class IndexWorker(QObject):
                         "Use Rebuild Firebird Index first."
                     )
                 video_count, toml_count, matched_count, indexed_at = summary
-                rows = apply_approvals(rows, approved)
+                rows = apply_qc_statuses(rows, qc_records)
                 self.finished.emit(
                     rows,
                     int(video_count),
@@ -525,7 +523,7 @@ class IndexWorker(QObject):
                         "reason": str(exc),
                     })
 
-            rows = apply_approvals(rows, approved)
+            rows = apply_qc_statuses(rows, qc_records)
             index.replace(
                 self.search_root,
                 rows,
@@ -548,6 +546,169 @@ class IndexWorker(QObject):
 
 
 
+
+class SubmitWorker(QObject):
+    progress = pyqtSignal(str)
+    job_submitted = pyqtSignal(dict)
+    finished = pyqtSignal(list)
+    failed = pyqtSignal(str)
+
+    def __init__(self, host, key, project_root, repo_root, selected_rows, run_mode, parameters):
+        super().__init__()
+        self.host = host
+        self.key = key
+        self.project_root = project_root.rstrip("/")
+        self.repo_root = repo_root.rstrip("/")
+        self.selected_rows = selected_rows
+        self.run_mode = run_mode
+        self.parameters = parameters
+
+    @staticmethod
+    def _postprocess_args(analysis, p):
+        if analysis == "fight":
+            vals = {
+                "analysis-stop-frame": p["analysis_stop_frame"],
+                "window-frames": p["window_frames"],
+                "contact-px": p["contact_px"],
+                "fight-px": p["fight_px"],
+                "min-fight-frames": p["min_fight_frames"],
+                "roi-wall-buffer-px": p["roi_wall_buffer_px"],
+            }
+        else:
+            vals = {
+                "analysis-stop-frame": p["ba_analysis_stop_frame"],
+                "move-threshold-px": p["move_threshold_px"],
+                "movement-onset-consecutive-frames": p["movement_onset_consecutive_frames"],
+                "roi-wall-buffer-px": p["ba_roi_wall_buffer_px"],
+                "turtling-window-frames": p["turtling_window_frames"],
+                "turtling-min-duration-frames": p["turtling_min_duration_frames"],
+            }
+        return " ".join(f"--{k} {v}" for k, v in vals.items())
+
+    def run(self):
+        messages = []
+        try:
+            ssh = SSH(self.host, self.key)
+            total = len(self.selected_rows)
+            for position, payload in enumerate(self.selected_rows, 1):
+                row = payload["row"]
+                analysis = payload["analysis"]
+                area_min = payload["area_min"]
+                area_max = payload["area_max"]
+                background_min = payload["background_min"]
+                label = f"{Path(row['video']).name} / {row['cell']}"
+                self.progress.emit(f"Preparing {position} of {total}: {label}")
+                try:
+                    now = datetime.now()
+                    stamp = now.strftime("%Y%m%d_%H%M%S")
+                    run_index = int(ssh.run(
+                        f"mkdir -p {shlex.quote(self.project_root)}; "
+                        f"if [[ -f {shlex.quote(self.project_root + '/run_index.tsv')} ]]; then "
+                        f"awk -F'\\t' 'NR>1 && $1+0>m{{m=$1+0}} END{{print m+1}}' "
+                        f"{shlex.quote(self.project_root + '/run_index.tsv')}; else echo 1; fi"
+                    ).strip())
+                    video_stem = Path(row["video"]).stem
+                    run_dir = (
+                        f"{self.project_root}/runs/{video_stem}/{row['cell']}/"
+                        f"run_{run_index:05d}_{stamp}"
+                    )
+                    input_dir = run_dir + "/input"
+                    session_out = run_dir + "/idtracker"
+                    metadata_path = run_dir + "/run_metadata.json"
+                    ssh.run(f"mkdir -p {shlex.quote(input_dir)} {shlex.quote(session_out)}")
+                    self.progress.emit(f"Reading TOML for {label}...")
+                    source = ssh.read(row["toml"])
+                    doc = tomlkit.parse(source)
+                    updates = {"area": 0, "intensity": 0}
+
+                    def edit_thresholds(obj):
+                        if isinstance(obj, dict):
+                            for key, value in obj.items():
+                                key_lower = str(key).lower()
+                                if key_lower in {"area_ths", "area_thresholds"}:
+                                    updates["area"] += _update_threshold_pairs(value, minimum=area_min, maximum=area_max)
+                                elif key_lower in {"intensity_ths", "intensity_thresholds"}:
+                                    updates["intensity"] += _update_threshold_pairs(value, minimum=background_min, maximum=None)
+                                edit_thresholds(value)
+                        elif isinstance(obj, list):
+                            for value in obj:
+                                edit_thresholds(value)
+
+                    edit_thresholds(doc)
+                    if updates["area"] == 0:
+                        raise ValueError("No blob-area threshold pair was found in the TOML.")
+                    if updates["intensity"] == 0:
+                        raise ValueError("No intensity threshold pair was found in the TOML.")
+                    _validate_thresholds(doc)
+                    copied_toml = input_dir + "/" + Path(row["toml"]).name
+                    rendered_toml = tomlkit.dumps(doc)
+                    _validate_thresholds(tomlkit.parse(rendered_toml))
+                    ssh.write(copied_toml, rendered_toml)
+                    metadata = {
+                        "run_index": run_index,
+                        "run_timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+                        "analysis_type": analysis,
+                        "video_path": row["video"],
+                        "video_filename": Path(row["video"]).name,
+                        "toml_source_path": row["toml"],
+                        "toml_run_copy_path": copied_toml,
+                        "cell_label": row["cell"],
+                        "remote_run_dir": run_dir,
+                        "session_path": "",
+                        "record_id": f"{video_stem}_{row['cell']}_R{run_index:05d}_{stamp}",
+                        "parameters": {
+                            "area_min": area_min,
+                            "area_max": None if math.isinf(area_max) else area_max,
+                            "area_max_is_infinite": math.isinf(area_max),
+                            "background_intensity_min": background_min,
+                            "run_mode": self.run_mode,
+                            **self.parameters,
+                        },
+                    }
+                    ssh.write(metadata_path, json.dumps(metadata, indent=2, allow_nan=False))
+                    env = {
+                        "PIPELINE_REPO_ROOT": self.repo_root,
+                        "PIPELINE_PROJECT_ROOT": self.project_root,
+                        "PIPELINE_RUN_DIR": run_dir,
+                        "PIPELINE_TOML": copied_toml,
+                        "PIPELINE_VIDEO": row["video"],
+                        "PIPELINE_ANALYSIS_TYPE": analysis,
+                        "PIPELINE_METADATA_JSON": metadata_path,
+                        "PIPELINE_SESSION_OUTPUT_DIR": session_out,
+                        "PIPELINE_SESSION": "",
+                        "PIPELINE_RUN_MODE": self.run_mode,
+                        "PIPELINE_ARCHIVE_SESSION": "0",
+                        "PIPELINE_POSTPROCESS_EXTRA_ARGS": self._postprocess_args(analysis, self.parameters),
+                    }
+                    exports = " ".join(f"{k}={shlex.quote(str(v))}" for k, v in env.items())
+                    command = f"export {exports}; bash {shlex.quote(self.repo_root + '/scripts/firebird/submit_pipeline_run.sh')}"
+                    self.progress.emit(f"Submitting SLURM jobs for {label}...")
+                    result = ssh.run(command)
+                    job_ids = {"IDTRACKER_JOB": "", "POSTPROCESS_JOB": "", "COLLECTOR_JOB": ""}
+                    for output_line in result.splitlines():
+                        if "=" in output_line:
+                            key, value = output_line.split("=", 1)
+                            if key in job_ids:
+                                job_ids[key] = value.strip()
+                    job = {
+                        "run_index": run_index,
+                        "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
+                        "label": label,
+                        "idtracker_job": job_ids["IDTRACKER_JOB"],
+                        "postprocess_job": job_ids["POSTPROCESS_JOB"],
+                        "collector_job": job_ids["COLLECTOR_JOB"],
+                        "status": "Postprocess submitted" if self.run_mode == "postprocess" else "Tracking submitted",
+                        "run_dir": run_dir,
+                    }
+                    self.job_submitted.emit(job)
+                    messages.append(f"Run {run_index:05d}: {result.strip()}")
+                except Exception as exc:
+                    messages.append(f"{row['toml']}: ERROR {exc}")
+                    self.progress.emit(f"Submission error for {label}: {exc}")
+            self.finished.emit(messages)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
 class Window(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -555,6 +716,8 @@ class Window(QMainWindow):
         self.rows = []
         self.jobs = []
         self.index_thread = None
+        self.submit_thread = None
+        self.submit_worker = None
         self.index_worker = None
         self.index_db_path = str(
             Path.home() / '.beetle_idtracker' / 'firebird_index.sqlite3'
@@ -634,13 +797,26 @@ class Window(QMainWindow):
         self.summary.setWordWrap(True)
         layout.addWidget(self.summary)
 
+        search_filters = QHBoxLayout()
+        search_filters.addWidget(QLabel("Search/filter:"))
+        self.toml_filter = QLineEdit()
+        self.toml_filter.setPlaceholderText(
+            "Type any part of a video name, cell, TOML path, analysis type, QC status, record ID, notes, status, or reason"
+        )
+        self.toml_filter.textChanged.connect(self.apply_scan_filter)
+        search_filters.addWidget(self.toml_filter, 1)
+        clear_toml_filter = QPushButton("Clear Filter")
+        clear_toml_filter.clicked.connect(self.toml_filter.clear)
+        search_filters.addWidget(clear_toml_filter)
+        layout.addLayout(search_filters)
+
         selection = QHBoxLayout()
         for label, action in [("Check All", self.check_all), ("Uncheck All", self.uncheck_all), ("Invert Selection", self.invert_selection)]:
             b = QPushButton(label); b.clicked.connect(action); selection.addWidget(b)
         selection.addStretch()
-        selection.addWidget(QLabel("Approved runs:"))
+        selection.addWidget(QLabel("QC score/status:"))
         self.approved_filter = QComboBox()
-        self.approved_filter.addItems(["Show all", "Hide approved", "Approved only"])
+        self.approved_filter.addItems(["All QC statuses", "Unscored only", "Scored only", "PENDING", "APPROVED", "NEEDS RERUN", "RERUNNING", "SUPERSEDED"])
         self.approved_filter.currentTextChanged.connect(self.apply_scan_filter)
         selection.addWidget(self.approved_filter)
         layout.addLayout(selection)
@@ -657,7 +833,7 @@ class Window(QMainWindow):
             "Blob min",
             "Blob max",
             "Background threshold min",
-            "Approved run",
+            "QC score/status",
             "Status",
             "Reason",
         ])
@@ -796,9 +972,9 @@ class Window(QMainWindow):
         self.qc_status_filter=QComboBox();self.qc_status_filter.addItems(["All statuses","PENDING","APPROVED","NEEDS RERUN","RERUNNING","SUPERSEDED"]);self.qc_status_filter.currentTextChanged.connect(self.apply_qc_filter);filters.addWidget(self.qc_status_filter)
         clear=QPushButton("Clear Filter");clear.clicked.connect(lambda:(self.qc_filter.clear(),self.qc_status_filter.setCurrentIndex(0)));filters.addWidget(clear);layout.addLayout(filters)
 
-        self.qc_table=QTableWidget(0,10);self.qc_table.setHorizontalHeaderLabels(["Record ID","Date run","Analysis","Video / Camera","Cell","Pipeline","QC status","Replaces","Replaced by","Run folder"]);self.qc_table.setSelectionBehavior(QAbstractItemView.SelectRows);self.qc_table.setSortingEnabled(True);self.qc_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents);self.qc_table.horizontalHeader().setSectionResizeMode(9,QHeaderView.Stretch);layout.addWidget(self.qc_table)
+        self.qc_table=QTableWidget(0,11);self.qc_table.setHorizontalHeaderLabels(["Record ID","Date run","Analysis","Video / Camera","Cell","Pipeline","QC status","Replaces","Replaced by","Notes","Run folder"]);self.qc_table.setSelectionBehavior(QAbstractItemView.SelectRows);self.qc_table.setSortingEnabled(True);self.qc_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents);self.qc_table.horizontalHeader().setSectionResizeMode(9,QHeaderView.Stretch);self.qc_table.horizontalHeader().setSectionResizeMode(10,QHeaderView.Stretch);layout.addWidget(self.qc_table)
         row=QHBoxLayout()
-        for label,fn in [("Refresh QC",self.refresh_qc),("Approve",lambda:self.set_qc_decision('APPROVED')),("Needs Rerun",lambda:self.set_qc_decision('RERUN')),("Mark Rerunning",lambda:self.set_qc_decision('RERUNNING')),("Mark Superseded",lambda:self.set_qc_decision('SUPERSEDED')),("Mark Pending",lambda:self.set_qc_decision('PENDING')),("Download Selected",self.download_selected_qc),("View Files",self.view_selected_qc_files),("Download Masters",self.download_master_spreadsheets)]:
+        for label,fn in [("Refresh QC",self.refresh_qc),("Save Notes",self.save_qc_notes),("Approve",lambda:self.set_qc_decision('APPROVED')),("Needs Rerun",lambda:self.set_qc_decision('RERUN')),("Mark Rerunning",lambda:self.set_qc_decision('RERUNNING')),("Mark Superseded",lambda:self.set_qc_decision('SUPERSEDED')),("Mark Pending",lambda:self.set_qc_decision('PENDING')),("Download Selected",self.download_selected_qc),("View Files",self.view_selected_qc_files),("Download Masters",self.download_master_spreadsheets)]:
             b=QPushButton(label);b.clicked.connect(fn);row.addWidget(b)
         layout.addLayout(row);self.qc_message=QLabel('');self.qc_message.setWordWrap(True);layout.addWidget(self.qc_message);return page
 
@@ -811,9 +987,11 @@ class Window(QMainWindow):
             labels={'DONE':'APPROVED','RERUN':'NEEDS RERUN'}
             for i,r in enumerate(rows):
                 status=labels.get((r.get('qc_decision') or 'PENDING').upper(),(r.get('qc_decision') or 'PENDING').upper())
-                vals=[r.get('record_id',''),r.get('date_run',''),r.get('analysis',''),r.get('video',''),r.get('cell',''),r.get('pipeline_status',''),status,r.get('replaces',''),r.get('replaced_by',''),r.get('run_dir','')]
+                vals=[r.get('record_id',''),r.get('date_run',''),r.get('analysis',''),r.get('video',''),r.get('cell',''),r.get('pipeline_status',''),status,r.get('replaces',''),r.get('replaced_by',''),r.get('notes',''),r.get('run_dir','')]
                 for c,v in enumerate(vals):
-                    item=QTableWidgetItem(str(v));item.setData(Qt.UserRole,r);self.qc_table.setItem(i,c,item)
+                    item=QTableWidgetItem(str(v));item.setData(Qt.UserRole,r)
+                    if c != 9: item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                    self.qc_table.setItem(i,c,item)
             self.qc_table.setSortingEnabled(True);self.apply_qc_filter();self.qc_message.setText(f"Loaded {len(rows)} collected runs.")
         except Exception as exc: QMessageBox.critical(self,'QC refresh failed',str(exc))
 
@@ -831,11 +1009,28 @@ class Window(QMainWindow):
         rows=self.qc_table.selectionModel().selectedRows() if hasattr(self,'qc_table') else []
         return self.qc_table.item(rows[0].row(),0).data(Qt.UserRole) if rows else None
 
+    def _selected_qc_note(self):
+        rows=self.qc_table.selectionModel().selectedRows() if hasattr(self,'qc_table') else []
+        if not rows:return ''
+        item=self.qc_table.item(rows[0].row(),9)
+        return item.text().strip() if item else ''
+
+    def save_qc_notes(self):
+        rec=self.selected_qc()
+        if not rec:return
+        decision=(rec.get('qc_decision') or 'PENDING').upper()
+        try:
+            note=self._selected_qc_note()
+            cmd=f"{shlex.quote(self.repo_root.text().rstrip('/')+'/scripts/firebird/set_qc_status.sh')} {shlex.quote(self.project_root.text())} {shlex.quote(rec['record_id'])} {shlex.quote(decision)} {shlex.quote(note)}"
+            result=self.ssh().run(cmd);self.qc_message.setText(f"Saved notes for {rec['record_id']}. {result.strip()}");self.refresh_qc()
+        except Exception as exc: QMessageBox.critical(self,'QC notes update failed',str(exc))
+
     def set_qc_decision(self,decision):
         rec=self.selected_qc()
         if not rec:return
         try:
-            cmd=f"{shlex.quote(self.repo_root.text().rstrip('/')+'/scripts/firebird/set_qc_status.sh')} {shlex.quote(self.project_root.text())} {shlex.quote(rec['record_id'])} {decision}"
+            note=self._selected_qc_note()
+            cmd=f"{shlex.quote(self.repo_root.text().rstrip('/')+'/scripts/firebird/set_qc_status.sh')} {shlex.quote(self.project_root.text())} {shlex.quote(rec['record_id'])} {shlex.quote(decision)} {shlex.quote(note)}"
             result=self.ssh().run(cmd);self.qc_message.setText(f"{rec['record_id']} marked {decision}. {result.strip()}");self.refresh_qc()
         except Exception as exc: QMessageBox.critical(self,'QC update failed',str(exc))
 
@@ -991,11 +1186,13 @@ class Window(QMainWindow):
         timestamp = datetime.fromtimestamp(indexed_at).strftime(
             "%Y-%m-%d %H:%M:%S"
         )
-        approved_count = sum(bool(row.get("approved")) for row in rows)
+        approved_count = sum(row.get("qc_status") == "APPROVED" for row in rows)
+        rerun_count = sum(row.get("qc_status") == "NEEDS RERUN" for row in rows)
+        scored_count = sum(row.get("qc_status") not in (None, "", "UNSCORED") for row in rows)
         self.summary.setText(
             f"Index dated {timestamp}: {video_count:,} videos, "
             f"{toml_count:,} TOMLs, {matched_count:,} exact matches; "
-            f"{approved_count:,} already approved."
+            f"{scored_count:,} scored ({approved_count:,} approved, {rerun_count:,} need rerun)."
         )
         self.finish_index_ui()
 
@@ -1037,12 +1234,15 @@ class Window(QMainWindow):
             combo.addItems(["ba", "fight"])
             combo.setCurrentText(row["analysis"])
             self.table.setCellWidget(i, 4, combo)
-            approved_text = ""
-            if row.get("approved"):
-                approved_text = row.get("approved_date", "") or "APPROVED"
-                if row.get("approved_record_id"):
-                    approved_text += f" | {row['approved_record_id']}"
-            self.table.setItem(i, 8, QTableWidgetItem(approved_text))
+            qc_status = row.get("qc_status", "UNSCORED") or "UNSCORED"
+            qc_text = qc_status
+            if row.get("qc_date"):
+                qc_text += f" | {row['qc_date']}"
+            if row.get("qc_record_id"):
+                qc_text += f" | {row['qc_record_id']}"
+            if row.get("qc_notes"):
+                qc_text += f" | {row['qc_notes']}"
+            self.table.setItem(i, 8, QTableWidgetItem(qc_text))
             for c, key in ((5, "area_min"), (6, "area_max"), (7, "background_min"), (9, "status"), (10, "reason")):
                 self.table.setItem(i, c, QTableWidgetItem(str(row[key])))
         self.table.setSortingEnabled(True)
@@ -1052,12 +1252,33 @@ class Window(QMainWindow):
         if not hasattr(self, "table") or not hasattr(self, "approved_filter"):
             return
         mode = self.approved_filter.currentText()
+        needle = (self.toml_filter.text() if hasattr(self, "toml_filter") else "").strip().lower()
         for table_row in range(self.table.rowCount()):
             item = self.table.item(table_row, 0)
             data = item.data(Qt.UserRole) if item else {}
-            approved = bool(data.get("approved")) if isinstance(data, dict) else False
-            hidden = (mode == "Hide approved" and approved) or (mode == "Approved only" and not approved)
-            self.table.setRowHidden(table_row, hidden)
+            qc_status = (data.get("qc_status", "UNSCORED") if isinstance(data, dict) else "UNSCORED") or "UNSCORED"
+            qc_status = normalize_qc_status(qc_status)
+
+            values = []
+            for column in range(self.table.columnCount()):
+                widget = self.table.cellWidget(table_row, column)
+                if isinstance(widget, QComboBox):
+                    values.append(widget.currentText())
+                table_item = self.table.item(table_row, column)
+                if table_item is not None:
+                    values.append(table_item.text())
+            haystack = " ".join(values).lower()
+
+            if mode == "All QC statuses":
+                status_visible = True
+            elif mode == "Unscored only":
+                status_visible = qc_status == "UNSCORED"
+            elif mode == "Scored only":
+                status_visible = qc_status != "UNSCORED"
+            else:
+                status_visible = qc_status == mode.upper()
+            search_visible = not needle or needle in haystack
+            self.table.setRowHidden(table_row, not (status_visible and search_visible))
 
     def postprocess_args(self, analysis):
         p=self.param
@@ -1068,8 +1289,11 @@ class Window(QMainWindow):
         return ' '.join(f'--{k} {v}' for k,v in vals.items())
 
     def submit(self):
-        ssh = self.ssh()
-        messages = []
+        if getattr(self, "submit_thread", None) is not None:
+            QMessageBox.information(self, "Submission in progress", "A submission is already running.")
+            return
+
+        selected = []
         for i in range(self.table.rowCount()):
             use_item = self.table.item(i, 0)
             if use_item is None or use_item.checkState() != Qt.Checked:
@@ -1077,147 +1301,69 @@ class Window(QMainWindow):
             row = use_item.data(Qt.UserRole)
             if not isinstance(row, dict):
                 continue
-                continue
             try:
-                analysis = self.table.cellWidget(i, 4).currentText()
-                area_min = float(self.table.item(i, 5).text())
-                area_max = float(self.table.item(i, 6).text())
-                background_min = float(self.table.item(i, 7).text())
-                now = datetime.now()
-                stamp = now.strftime("%Y%m%d_%H%M%S")
-                run_index = int(ssh.run(
-                    f"mkdir -p {shlex.quote(self.project_root.text())}; "
-                    f"if [[ -f {shlex.quote(self.project_root.text() + '/run_index.tsv')} ]]; then "
-                    f"awk -F'\\t' 'NR>1 && $1+0>m{{m=$1+0}} END{{print m+1}}' "
-                    f"{shlex.quote(self.project_root.text() + '/run_index.tsv')}; else echo 1; fi"
-                ).strip())
-                video_stem = Path(row["video"]).stem
-                run_dir = (
-                    f"{self.project_root.text().rstrip('/')}/runs/{video_stem}/"
-                    f"{row['cell']}/run_{run_index:05d}_{stamp}"
-                )
-                input_dir = run_dir + "/input"
-                session_out = run_dir + "/idtracker"
-                metadata_path = run_dir + "/run_metadata.json"
-                ssh.run(f"mkdir -p {shlex.quote(input_dir)} {shlex.quote(session_out)}")
-                source = ssh.read(row["toml"])
-                doc = tomlkit.parse(source)
-                updates = {"area": 0, "intensity": 0}
-
-                def edit_thresholds(obj):
-                    if isinstance(obj, dict):
-                        for key, value in obj.items():
-                            key_lower = str(key).lower()
-                            if key_lower in {"area_ths", "area_thresholds"}:
-                                updates["area"] += _update_threshold_pairs(
-                                    value,
-                                    minimum=area_min,
-                                    maximum=area_max,
-                                )
-                            elif key_lower in {
-                                "intensity_ths",
-                                "intensity_thresholds",
-                            }:
-                                # GUI edits the MINIMUM background intensity
-                                # threshold. The maximum is preserved.
-                                updates["intensity"] += _update_threshold_pairs(
-                                    value,
-                                    minimum=background_min,
-                                    maximum=None,
-                                )
-                            edit_thresholds(value)
-                    elif isinstance(obj, list):
-                        for value in obj:
-                            edit_thresholds(value)
-
-                edit_thresholds(doc)
-
-                if updates["area"] == 0:
-                    raise ValueError(
-                        "No blob-area threshold pair was found in the TOML."
-                    )
-                if updates["intensity"] == 0:
-                    raise ValueError(
-                        "No intensity threshold pair was found in the TOML."
-                    )
-
-                _validate_thresholds(doc)
-                copied_toml = input_dir + "/" + Path(row["toml"]).name
-                rendered_toml = tomlkit.dumps(doc)
-                reparsed = tomlkit.parse(rendered_toml)
-                _validate_thresholds(reparsed)
-                ssh.write(copied_toml, rendered_toml)
-                metadata = {
-                    "run_index": run_index,
-                    "run_timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
-                    "analysis_type": analysis,
-                    "video_path": row["video"],
-                    "video_filename": Path(row["video"]).name,
-                    "toml_source_path": row["toml"],
-                    "toml_run_copy_path": copied_toml,
-                    "cell_label": row["cell"],
-                    "remote_run_dir": run_dir,
-                    "session_path": "",
-                    "record_id": f"{video_stem}_{row['cell']}_R{run_index:05d}_{stamp}",
-                    "parameters": {
-                        "area_min": area_min,
-                        "area_max": None if math.isinf(area_max) else area_max,
-                        "area_max_is_infinite": math.isinf(area_max),
-                        "background_intensity_min": background_min,
-                        "run_mode": "postprocess" if self.run_post.isChecked() else "full",
-                        **{k: w.value() for k,w in self.param.items()},
-                    },
-                }
-                ssh.write(metadata_path, json.dumps(metadata, indent=2, allow_nan=False))
-                env = {
-                    "PIPELINE_REPO_ROOT": self.repo_root.text().strip(),
-                    "PIPELINE_PROJECT_ROOT": self.project_root.text().strip(),
-                    "PIPELINE_RUN_DIR": run_dir,
-                    "PIPELINE_TOML": copied_toml,
-                    "PIPELINE_VIDEO": row["video"],
-                    "PIPELINE_ANALYSIS_TYPE": analysis,
-                    "PIPELINE_METADATA_JSON": metadata_path,
-                    "PIPELINE_SESSION_OUTPUT_DIR": session_out,
-                    "PIPELINE_SESSION": "",
-                    "PIPELINE_RUN_MODE": "postprocess" if self.run_post.isChecked() else "full",
-                    "PIPELINE_ARCHIVE_SESSION": "0",
-                    "PIPELINE_POSTPROCESS_EXTRA_ARGS": self.postprocess_args(analysis),
-                }
-                exports = " ".join(
-                    f"{k}={shlex.quote(str(v))}" for k, v in env.items()
-                )
-                command = (
-                    f"export {exports}; "
-                    f"bash {shlex.quote(self.repo_root.text().rstrip('/') + '/scripts/firebird/submit_pipeline_run.sh')}"
-                )
-                result = ssh.run(command)
-                job_ids = {
-                    "IDTRACKER_JOB": "",
-                    "POSTPROCESS_JOB": "",
-                    "COLLECTOR_JOB": "",
-                }
-                for output_line in result.splitlines():
-                    if "=" not in output_line:
-                        continue
-                    key, value = output_line.split("=", 1)
-                    if key in job_ids:
-                        job_ids[key] = value.strip()
-
-                self.jobs.append({
-                    "run_index": run_index,
-                    "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"),
-                    "label": f"{Path(row['video']).name} / {row['cell']}",
-                    "idtracker_job": job_ids["IDTRACKER_JOB"],
-                    "postprocess_job": job_ids["POSTPROCESS_JOB"],
-                    "collector_job": job_ids["COLLECTOR_JOB"],
-                    "status": "Postprocess submitted" if self.run_post.isChecked() else "Tracking submitted",
-                    "run_dir": run_dir,
+                selected.append({
+                    "row": dict(row),
+                    "analysis": self.table.cellWidget(i, 4).currentText(),
+                    "area_min": float(self.table.item(i, 5).text()),
+                    "area_max": float(self.table.item(i, 6).text()),
+                    "background_min": float(self.table.item(i, 7).text()),
                 })
-                self.populate_jobs_table()
-                messages.append(f"Run {run_index:05d}: {result.strip()}")
             except Exception as exc:
-                messages.append(f"{row['toml']}: ERROR {exc}")
-        self.result.setText("\n".join(messages) if messages else "No rows selected.")
+                QMessageBox.critical(self, "Invalid row parameters", f"Could not read parameters for row {i + 1}: {exc}")
+                return
+
+        if not selected:
+            self.result.setText("No rows selected.")
+            return
+
+        parameters = {key: widget.value() for key, widget in self.param.items()}
+        run_mode = "postprocess" if self.run_post.isChecked() else "full"
+        self.submit_button.setEnabled(False)
+        self.result.setText(f"Starting submission of {len(selected)} selected run(s)...")
+        QApplication.processEvents()
+
+        self.submit_thread = QThread(self)
+        self.submit_worker = SubmitWorker(
+            self.host.text().strip(),
+            self.key.text().strip(),
+            self.project_root.text().strip(),
+            self.repo_root.text().strip(),
+            selected,
+            run_mode,
+            parameters,
+        )
+        self.submit_worker.moveToThread(self.submit_thread)
+        self.submit_thread.started.connect(self.submit_worker.run)
+        self.submit_worker.progress.connect(self.result.setText)
+        self.submit_worker.job_submitted.connect(self._submission_job_added)
+        self.submit_worker.finished.connect(self._submission_finished)
+        self.submit_worker.failed.connect(self._submission_failed)
+        self.submit_worker.finished.connect(self.submit_thread.quit)
+        self.submit_worker.failed.connect(self.submit_thread.quit)
+        self.submit_thread.finished.connect(self._cleanup_submit_thread)
+        self.submit_thread.start()
+
+    def _submission_job_added(self, job):
+        self.jobs.append(job)
+        self.populate_jobs_table()
+
+    def _submission_finished(self, messages):
+        self.result.setText("\n".join(messages) if messages else "Submission completed with no output.")
+        self.submit_button.setEnabled(True)
+
+    def _submission_failed(self, message):
+        self.result.setText(f"Submission failed: {message}")
+        self.submit_button.setEnabled(True)
+        QMessageBox.critical(self, "Submission failed", message)
+
+    def _cleanup_submit_thread(self):
+        if getattr(self, "submit_worker", None) is not None:
+            self.submit_worker.deleteLater()
+        if getattr(self, "submit_thread", None) is not None:
+            self.submit_thread.deleteLater()
+        self.submit_worker = None
+        self.submit_thread = None
 
 
 
@@ -1443,6 +1589,9 @@ class Window(QMainWindow):
     def closeEvent(self, event):
         if self.index_worker is not None:
             self.index_worker.cancel()
+        if self.submit_thread is not None:
+            self.submit_thread.quit()
+            self.submit_thread.wait(3000)
         if self.index_thread is not None:
             self.index_thread.quit()
             self.index_thread.wait(3000)

@@ -1,3 +1,21 @@
+# Changelog
+
+## 0.9.17 - Full QC status in Scan & Match
+
+- Replaced the approval-only Scan & Match column with the latest QC score/status for each exact video, cell, and analysis match.
+- Added filters for Unscored, Scored, Pending, Approved, Needs rerun, Rerunning, and Superseded.
+- Displays the matching QC date, record ID, and notes in the TOML table.
+- Check All, Uncheck All, and Invert continue to act only on visible rows, enabling a Needs rerun filter followed by Check All.
+- Preserves compatibility with legacy DONE, RERUN, and FIXED decision labels.
+
+# v0.9.15 — Scan & Match TOML search
+
+- Added a live, case-insensitive search bar above the Scan & Match TOML table.
+- Search covers video names, cell labels, TOML paths, analysis type, parameters, approval information, status, and reason.
+- Search combines with the Approved runs filter.
+- Check All, Uncheck All, and Invert Selection continue to affect only visible rows.
+- Added a Clear Filter button.
+
 # v0.9.13 — macOS package import fix
 
 - Added `app/__init__.py` so `app` is an explicit Python package.
@@ -193,3 +211,16 @@
 - Fixed successful IDtracker runs being marked failed when IDtracker ignored the TOML filename and created a video-based session name with a numeric suffix.
 - Session discovery now follows the proven fight-batch pattern of locating an actual complete session tree.
 - Parallel same-video jobs are distinguished using the video path, ROI polygon, complete trajectory files, and the job start marker.
+
+## 0.9.16
+- Moved run preparation and SLURM submission off the PyQt main thread.
+- Submit Selected Runs now remains responsive during SSH/TOML/metadata operations.
+- Added immediate progress messages and incremental population of the submitted-jobs table.
+- Prevents duplicate clicks while a submission is active and reports SSH errors in the GUI.
+
+## v0.9.18 — QC notes in tables and summaries
+- Added an editable Notes column to the QC table and a Save Notes action.
+- QC decisions now preserve and submit the edited note.
+- Notes are stored in `QC/run_status.csv`.
+- Saving a note or QC decision annotates BA and fight summary CSVs with `qc_record_id`, `qc_decision`, and `qc_notes`.
+- Approved BA and fight master summary files now include `qc_notes`.
