@@ -1242,6 +1242,9 @@ class Window(QMainWindow):
         clear_toml_filter = QPushButton("Clear Filter")
         clear_toml_filter.clicked.connect(self.toml_filter.clear)
         search_filters.addWidget(clear_toml_filter)
+        export_search = QPushButton("Export Displayed Rows to CSV")
+        export_search.clicked.connect(self.export_visible_search_rows)
+        search_filters.addWidget(export_search)
         layout.addLayout(search_filters)
 
         selection = QHBoxLayout()
@@ -1438,7 +1441,9 @@ class Window(QMainWindow):
         self.qc_filter.textChanged.connect(self.apply_qc_filter);filters.addWidget(self.qc_filter,1)
         self.qc_status_filter=QComboBox();self.qc_status_filter.addItems(["All statuses","PENDING","APPROVED","NEEDS RERUN","RERUNNING","SUPERSEDED"]);self.qc_status_filter.currentTextChanged.connect(self.apply_qc_filter);filters.addWidget(self.qc_status_filter)
         self.qc_view_mode=QComboBox();self.qc_view_mode.addItems(["All QC records","Rerun comparisons","Flagged with later attempt","Flagged without later attempt","Ready to review for superseding"]);self.qc_view_mode.currentTextChanged.connect(self.rebuild_qc_table);filters.addWidget(self.qc_view_mode)
-        clear=QPushButton("Clear Filter");clear.clicked.connect(lambda:(self.qc_filter.clear(),self.qc_status_filter.setCurrentIndex(0),self.qc_view_mode.setCurrentIndex(0)));filters.addWidget(clear);layout.addLayout(filters)
+        clear=QPushButton("Clear Filter");clear.clicked.connect(lambda:(self.qc_filter.clear(),self.qc_status_filter.setCurrentIndex(0),self.qc_view_mode.setCurrentIndex(0)));filters.addWidget(clear)
+        export_qc=QPushButton("Export Displayed Rows to CSV");export_qc.clicked.connect(self.export_visible_qc_rows);filters.addWidget(export_qc)
+        layout.addLayout(filters)
 
         self.qc_table=QTableWidget(0,13);self.qc_table.setHorizontalHeaderLabels(["Comparison","Record ID","Date run","Analysis","Video / Camera","Cell","Attempt","Pipeline","QC status","Replaces","Replaced by","Notes","Run folder"]);self.qc_table.setSelectionBehavior(QAbstractItemView.SelectRows);self.qc_table.setSelectionMode(QAbstractItemView.SingleSelection);self.qc_table.setSortingEnabled(True);self.qc_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents);self.qc_table.horizontalHeader().setSectionResizeMode(11,QHeaderView.Stretch);self.qc_table.horizontalHeader().setSectionResizeMode(12,QHeaderView.Stretch);layout.addWidget(self.qc_table)
         row=QHBoxLayout()
@@ -1506,6 +1511,67 @@ class Window(QMainWindow):
             status=(self.qc_table.item(row,8).text() if self.qc_table.item(row,8) else '').upper()
             visible=(not needle or needle in hay) and (selected=='ALL STATUSES' or status==selected)
             self.qc_table.setRowHidden(row,not visible)
+
+    def _export_visible_table_csv(self, table, page_name, criteria, default_stem):
+        """Export exactly the currently visible table rows with filter provenance."""
+        visible_rows=[row for row in range(table.rowCount()) if not table.isRowHidden(row)]
+        downloads=Path.home()/"Downloads"/"IDtracker_Results"/"Exports"
+        downloads.mkdir(parents=True,exist_ok=True)
+        stamp=datetime.now().strftime("%Y%m%d_%H%M%S")
+        suggested=downloads/f"{default_stem}_{stamp}.csv"
+        path,_=QFileDialog.getSaveFileName(self,"Export displayed rows",str(suggested),"CSV files (*.csv)")
+        if not path:return
+        if not path.lower().endswith('.csv'):path += '.csv'
+        headers=[]
+        for column in range(table.columnCount()):
+            header=table.horizontalHeaderItem(column)
+            headers.append(header.text() if header else f"Column {column + 1}")
+        try:
+            with open(path,'w',newline='',encoding='utf-8-sig') as handle:
+                writer=csv.writer(handle)
+                writer.writerow(["EXPORT INFORMATION"])
+                writer.writerow(["Page",page_name])
+                writer.writerow(["Generated",datetime.now().astimezone().isoformat(timespec='seconds')])
+                writer.writerow(["Displayed row count",len(visible_rows)])
+                for key,value in criteria:
+                    writer.writerow([key,value])
+                writer.writerow([])
+                writer.writerow(headers)
+                for row in visible_rows:
+                    values=[]
+                    for column in range(table.columnCount()):
+                        widget=table.cellWidget(row,column)
+                        if isinstance(widget,QComboBox):
+                            values.append(widget.currentText())
+                        elif isinstance(widget,QCheckBox):
+                            values.append("TRUE" if widget.isChecked() else "FALSE")
+                        else:
+                            item=table.item(row,column)
+                            if column==0 and item is not None and bool(item.flags() & Qt.ItemIsUserCheckable):
+                                values.append("TRUE" if item.checkState()==Qt.Checked else "FALSE")
+                            else:
+                                values.append(item.text() if item is not None else "")
+                    writer.writerow(values)
+            QMessageBox.information(self,"CSV export complete",f"Exported {len(visible_rows)} displayed row(s).\n\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self,"CSV export failed",str(exc))
+
+    def export_visible_qc_rows(self):
+        criteria=[
+            ("Text search",self.qc_filter.text().strip() or "(none)"),
+            ("QC status filter",self.qc_status_filter.currentText()),
+            ("QC view",self.qc_view_mode.currentText()),
+        ]
+        self._export_visible_table_csv(self.qc_table,"QC",criteria,"QC_displayed_rows")
+
+    def export_visible_search_rows(self):
+        criteria=[
+            ("Text search",self.toml_filter.text().strip() or "(none)"),
+            ("QC score/status filter",self.approved_filter.currentText()),
+            ("Run failure filter",self.failure_filter.currentText()),
+            ("Index summary",self.summary.text()),
+        ]
+        self._export_visible_table_csv(self.table,"Search & Match",criteria,"Search_Match_displayed_rows")
 
     def selected_qc(self):
         rows=self.qc_table.selectionModel().selectedRows() if hasattr(self,'qc_table') else []

@@ -295,3 +295,10 @@
 - QC decisions update the table immediately and save to Firebird in background threads.
 - Added keyboard shortcuts: A approve, R needs rerun, Space open PDF, N next.
 - Added cache status feedback and cache-first PDF opening.
+
+## v0.9.28 — Filtered CSV exports and clearer 3-D axes
+- Added **Export Displayed Rows to CSV** to Search & Match and QC.
+- CSV exports contain only currently visible rows after all active search/filter settings.
+- Each CSV begins with export date, page, displayed-row count, and active filter criteria.
+- Moved the 3-D X-axis label to the high-numbered Y edge.
+- Moved 3-D Z-axis values and title to the low-numbered Y edge to keep them clear of tracks.

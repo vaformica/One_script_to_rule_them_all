@@ -1096,15 +1096,37 @@ def plot_tracks(
                            color="crimson", edgecolor="black", linewidth=0.20,
                            alpha=0.88, label="contact location", depthshade=False)
 
-        ax.set_xlabel(xlabel, labelpad=8)
+        # Place labels manually so they remain outside the trajectory volume.
+        # X is labelled along the high-numbered Y edge; Z tick numbers and its
+        # title are placed along the low-numbered Y edge, away from the tracks.
+        ax.set_xlabel("")
         ax.set_ylabel(ylabel, labelpad=8)
-        ax.set_zlabel("time from analysis start (s)", labelpad=8)
+        ax.set_zlabel("")
         analysis_label = "Behavioral assay" if len(xys) == 1 else "Fight"
         ax.set_title(f"{analysis_label} tracks through time (corner view)", pad=16)
         ax.set_xlim(xmin, xmax)
         ax.set_ylim(ymax, ymin)  # Match the image-coordinate orientation of 2-D maps.
         max_len = max((len(xy) for xy in xys), default=1)
-        ax.set_zlim(0, max(1.0, (max_len - 1) / fps))
+        zmax=max(1.0, (max_len - 1) / fps)
+        ax.set_zlim(0, zmax)
+
+        xspan=max(float(xmax-xmin),1.0)
+        yspan=max(float(ymax-ymin),1.0)
+        # X label: far/high-numbered end of Y, clear of the floor tracks.
+        ax.text3D((xmin+xmax)/2.0, ymax + 0.09*yspan, 0,
+                  xlabel, ha="center", va="top")
+        # Z values/title: low-numbered end of Y and slightly outside X.
+        zticks=ax.get_zticks()
+        ax.set_zticklabels([])
+        z_x=xmin - 0.075*xspan
+        z_y=ymin - 0.025*yspan
+        for tick in zticks:
+            if -1e-9 <= tick <= zmax + 1e-9:
+                ax.text3D(z_x, z_y, float(tick), f"{tick:g}",
+                          ha="right", va="center", fontsize=7)
+        ax.text3D(z_x - 0.055*xspan, z_y, zmax/2.0,
+                  "time from analysis start (s)",
+                  ha="center", va="center", rotation=90)
 
         # Tall box and oblique corner view closely mimic the classic idTracker plot.
         try:
